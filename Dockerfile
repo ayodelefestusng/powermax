@@ -14,7 +14,7 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 # Copy dependency files first to leverage Docker layer caching
-COPY pyproject.toml ./
+COPY pyproject.toml uv.lock ./
 
 # Install dependencies (will use system python 3.13 because UV_PYTHON_DOWNLOADS=never)
 RUN uv sync --frozen --no-cache --no-install-project
