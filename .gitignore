@@ -11,7 +11,8 @@ venv/
 
 # Logs
 *.log
-
+notes
+note2
 # VS Code
 .vscode/
 
