@@ -1,0 +1,18 @@
+[project]
+name = "worker"
+version = "0.1.0"
+description = "FastAPI Celery worker service for Laundry and FastAPI applications"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "celery[redis]>=5.4.0",
+    "redis>=5.0.0",
+    "flower>=2.0.0",
+    "sqlalchemy>=2.0.0",
+    "psycopg2-binary>=2.9.0",
+    "python-dotenv>=1.0.0",
+    "pytz>=2024.1",
+    "requests>=2.32.0",
+]

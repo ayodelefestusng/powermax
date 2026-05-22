@@ -1,0 +1,19 @@
+
+https://gemini.google.com/app/a53e863bb49e1f88
+
+
+sudo ufw allow 8000/tcp
+
+uv run uvicorn worker.main:app --host 0.0.0.0 --port 8009 --reload
+uv run celery -A worker.celery_app worker -l info
+uv run celery -A worker.celery_app beat -l info
+uv run celery -A worker.celery_app flower --port=5555
+
+
+2. Locally via standard Python virtual environment
+.venv\Scripts\uvicorn worker.main:app --host 0.0.0.0 --port 8009 --reload
+.venv\Scripts\celery -A worker.celery_app worker -l info
+.venv\Scripts\celery -A worker.celery_app beat -l info
+.venv\Scripts\celery -A worker.celery_app flower --port=5555
+
+
