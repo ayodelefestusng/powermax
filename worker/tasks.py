@@ -61,38 +61,46 @@ def format_duration(td):
 
 def send_whatsapp_power_message(number: str, text: str):
     """
-    Send a text message via Evolution API to the specified contact.
+    Send a text message via Evolution API to the specified contact and the power monitoring group.
     """
-    logger.info(f"Sending WhatsApp power alert to {number}")
     base_url = EVOLUTION_API_URL.rstrip('/')
     url = f"{base_url}/message/sendText/{POWER_INSTANCE}"
     headers = {
         "apikey": EVOLUTION_API_KEY,
         "Content-Type": "application/json"
     }
-    logger.info(f"Evolution API URL: {url}")
-    logger.info(f"Evolution API Key: {EVOLUTION_API_KEY}")
-    logger.info(f"Power Instance: {POWER_INSTANCE}")
-    logger.info(f"Number: {number}")
-    logger.info(f"Text: {text}")
+    
     clean_number = number.replace("+", "").strip()
-    recipient = f"{clean_number}@s.whatsapp.net" if "@" not in clean_number else clean_number
-    logger.info(f"Recipient: {recipient}")
+    primary_recipient = f"{clean_number}@s.whatsapp.net" if "@" not in clean_number else clean_number
     
-    payload = {
-        "number": recipient,
-        "text": text,
-        "linkPreview": False
-    }
-    logger.info(f"Payload: {payload}")
-    
-    try:
-        response = requests.post(url, json=payload, headers=headers, timeout=15)
-        logger.info(f"WhatsApp power alert sent to {recipient}. Status code: {response.status_code}")
-        return response.json()
-    except Exception as e:
-        logger.error(f"Failed to send WhatsApp power alert to {recipient}: {e}", exc_info=True)
-        return None
+    recipients = [primary_recipient]
+    group_id = "120363406600149982@g.us"
+    if group_id not in recipients:
+        recipients.append(group_id)
+        
+    last_response = None
+    for recipient in recipients:
+        logger.info(f"Sending WhatsApp power alert to {recipient}")
+        payload = {
+            "number": recipient,
+            "text": text,
+            "linkPreview": False
+        }
+        logger.info(f"Payload: {payload}")
+        
+        try:
+            response = requests.post(url, json=payload, headers=headers, timeout=15)
+            logger.info(f"WhatsApp power alert sent to {recipient}. Status code: {response.status_code}")
+            if response.status_code in [200, 201]:
+                resp_json = response.json()
+                if recipient == primary_recipient:
+                    last_response = resp_json
+                elif last_response is None:
+                    last_response = resp_json
+        except Exception as e:
+            logger.error(f"Failed to send WhatsApp power alert to {recipient}: {e}", exc_info=True)
+            
+    return last_response
 
 def generate_power_report(feeder, target_date, is_today=True):
     """
