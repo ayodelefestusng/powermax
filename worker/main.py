@@ -1,5 +1,6 @@
 from datetime import datetime, timezone, timedelta
 import logging
+from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -7,10 +8,30 @@ from sqlalchemy import text
 
 from worker.celery_app import celery_app
 from worker.db import engine
+from worker.tasks import send_whatsapp_power_message
 
 # Logger configuration
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("WorkerGateway")
+# logging.basicConfig(level=logging.INFO)
+# logger = logging.getLogger("WorkerGateway")
+
+
+# Configure root logging to output to console only
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    handlers=[logging.StreamHandler()],
+)
+
+# Configure PowerMonitor logger to output to both console (via propagation) and file
+logger = logging.getLogger("PowerMonitor")
+logger.setLevel(logging.INFO)
+
+log_dir = Path(__file__).parent / "logs"
+log_dir.mkdir(exist_ok=True)
+log_file = log_dir / "app.log"
+file_handler = logging.FileHandler(log_file)
+file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+logger.addHandler(file_handler)
 
 app = FastAPI(title="FastAPI Worker Gateway API")
 
@@ -105,6 +126,29 @@ async def test_email():
         }
     except Exception as e:
         logger.error(f"Failed to enqueue test email: {e}")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"status": "Error", "detail": str(e)}
+        )
+
+@app.get("/api/test-whatsapp/")
+async def test_whatsapp(phone: str = "2348021299221", message: str = "Test WhatsApp message from FastAPI"):
+    logger.info(f"Test WhatsApp endpoint called for phone: {phone}")
+    try:
+        res = send_whatsapp_power_message(phone, message)
+        if res:
+            return {
+                "status": "Success",
+                "message": "Test WhatsApp message sent",
+                "response": res
+            }
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to send WhatsApp message"
+            )
+    except Exception as e:
+        logger.error(f"Failed to send test WhatsApp: {e}")
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content={"status": "Error", "detail": str(e)}

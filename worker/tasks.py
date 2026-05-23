@@ -17,8 +17,8 @@ if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
 
 # Evolution API Credentials
-EVOLUTION_API_URL = os.getenv("EVOLUTION_API_URL", "https://whatsapp-1-evolution-api.xqqhik.easypanel.host")
-EVOLUTION_API_KEY = os.getenv("EVOLUTION_API_KEY", "429683C4C977415CAAFCCE10F7D57E11")
+EVOLUTION_API_URL = os.getenv("EVOLUTION_API_URL", "https://vectra-evolution-api.qgmg5v.easypanel.host")
+EVOLUTION_API_KEY = os.getenv("EVOLUTION_API_KEY", "")
 POWER_INSTANCE = os.getenv("POWER_INSTANCE", "power_max_bot")
 
 class FeederObj:
@@ -63,20 +63,28 @@ def send_whatsapp_power_message(number: str, text: str):
     """
     Send a text message via Evolution API to the specified contact.
     """
+    logger.info(f"Sending WhatsApp power alert to {number}")
     base_url = EVOLUTION_API_URL.rstrip('/')
     url = f"{base_url}/message/sendText/{POWER_INSTANCE}"
     headers = {
         "apikey": EVOLUTION_API_KEY,
         "Content-Type": "application/json"
     }
+    logger.info(f"Evolution API URL: {url}")
+    logger.info(f"Evolution API Key: {EVOLUTION_API_KEY}")
+    logger.info(f"Power Instance: {POWER_INSTANCE}")
+    logger.info(f"Number: {number}")
+    logger.info(f"Text: {text}")
     clean_number = number.replace("+", "").strip()
     recipient = f"{clean_number}@s.whatsapp.net" if "@" not in clean_number else clean_number
+    logger.info(f"Recipient: {recipient}")
     
     payload = {
         "number": recipient,
         "text": text,
         "linkPreview": False
     }
+    logger.info(f"Payload: {payload}")
     
     try:
         response = requests.post(url, json=payload, headers=headers, timeout=15)
