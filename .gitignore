@@ -16,6 +16,10 @@ note2
 # VS Code
 .vscode/
 
+# Environment files
+.env
+.env.*
+
 # Docker
 *.pid
 *.seed
