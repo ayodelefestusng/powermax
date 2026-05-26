@@ -167,12 +167,12 @@ async def power_update1(data: PowerStatus, request: Request):
 
     try:
         # Check if the hardware SIM identity matches the designated contact phone
-        if data.msisdn != "UNKNOWN" and data.msisdn.strip() != data.contact_phone.strip():
-            logger.warning(
-                f"SECURITY MATCH MISMATCH DETECTED: Node {data.transformer_name} reported SIM ID {data.msisdn} "
-                f"but expects Contact Profile Phone {data.contact_phone}!"
-            )
-            try:
+        try:
+            if data.msisdn != "UNKNOWN" and data.msisdn.strip() != data.contact_phone.strip():
+                logger.warning(
+                    f"SECURITY MATCH MISMATCH DETECTED: Node {data.transformer_name} reported SIM ID {data.msisdn} "
+                    f"but expects Contact Profile Phone {data.contact_phone}!"
+                )
                 celery_app.send_task(
                     "myapp.tasks.send_security_alert_email",
                     args=[
@@ -184,8 +184,8 @@ async def power_update1(data: PowerStatus, request: Request):
                     ]
                 )
                 logger.info("Security mismatch notification handed off to Celery workers.")
-            except Exception as celery_sec_err:
-                logger.error(f"Failed to offload security task to Celery: {celery_sec_err}")
+        except Exception as celery_sec_err:
+            logger.error(f"Failed to process or offload security task to Celery: {celery_sec_err}")
 
         # Persist feeder update in the database
         try:
