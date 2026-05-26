@@ -22,10 +22,78 @@ EVOLUTION_API_KEY = os.getenv("EVOLUTION_API_KEY", "")
 POWER_INSTANCE = os.getenv("POWER_INSTANCE", "power_max_bot")
 
 class FeederObj:
-    def __init__(self, id, name, contact_phone):
+    def __init__(self, id, name, contact_phone, band=None):
         self.id = id
         self.name = name
         self.contact_phone = contact_phone
+        self.band = band
+
+def format_time_colon(dt):
+    """
+    Format a datetime object to h:mmam/pm in Africa/Lagos timezone (e.g. 5:13am, 12:41pm).
+    """
+    lagos_tz = pytz.timezone("Africa/Lagos")
+    if dt.tzinfo:
+        dt = dt.astimezone(lagos_tz)
+    else:
+        dt = lagos_tz.localize(dt)
+    h_12 = dt.strftime("%I")
+    minute = dt.strftime("%M")
+    ampm = dt.strftime("%p").lower()
+    h_12 = str(int(h_12))  # strip leading zero
+    return f"{h_12}:{minute}{ampm}"
+
+def format_duration_short(td):
+    """
+    Format a timedelta object to e.g. 4h 40m or 31m.
+    """
+    total_seconds = int(td.total_seconds())
+    if total_seconds < 0:
+        total_seconds = 0
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    if hours > 0:
+        if minutes > 0:
+            return f"{hours}h {minutes}m"
+        return f"{hours}h"
+    else:
+        return f"{minutes}m"
+
+def format_supply_log_duration(td):
+    """
+    Format a timedelta object to e.g. 5 mins or 41 mins.
+    """
+    total_seconds = int(td.total_seconds())
+    if total_seconds < 0:
+        total_seconds = 0
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    if hours > 0:
+        if minutes > 0:
+            return f"{hours}h {minutes}m"
+        return f"{hours}h"
+    else:
+        if minutes == 1:
+            return "1 min"
+        return f"{minutes} mins"
+
+def format_last_status_duration(td):
+    """
+    Format a timedelta object to e.g. 1min or 5mins or 1h 45m.
+    """
+    total_seconds = int(td.total_seconds())
+    if total_seconds < 0:
+        total_seconds = 0
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    if hours > 0:
+        if minutes > 0:
+            return f"{hours}h {minutes}m"
+        return f"{hours}h"
+    else:
+        if minutes == 1:
+            return "1min"
+        return f"{minutes}mins"
 
 def format_time_dot(dt):
     """
@@ -105,7 +173,9 @@ def send_whatsapp_power_message(number: str, text: str):
 def generate_power_report(feeder, target_date, is_today=True):
     """
     Query power status updates and reconstruct the power cycles on the target date.
+    Supports real-time (today) format and End of Day (yesterday) format.
     """
+    import re
     lagos_tz = pytz.timezone("Africa/Lagos")
     
     start_naive = datetime.combine(target_date, time.min)
@@ -168,38 +238,212 @@ def generate_power_report(feeder, target_date, is_today=True):
         end_of_cycle = make_aware_lagos(datetime.now(lagos_tz)) if is_today else make_aware_lagos(end_dt)
         cycles.append((current_on, end_of_cycle))
         
-    # Format cycles and compute supply duration
-    lines = []
-    total_supply = timedelta()
+    # Reconstruct outages (OFF periods) for the day
+    outages = []
+    if cycles:
+        if cycles[0][0] > make_aware_lagos(start_dt):
+            outages.append((make_aware_lagos(start_dt), cycles[0][0]))
+        for i in range(len(cycles) - 1):
+            outages.append((cycles[i][1], cycles[i+1][0]))
+        if cycles[-1][1] < make_aware_lagos(end_dt):
+            outages.append((cycles[-1][1], make_aware_lagos(end_dt)))
+    else:
+        outages.append((make_aware_lagos(start_dt), make_aware_lagos(end_dt)))
+        
+    total_supply = sum((off - on for on, off in cycles), timedelta())
     
-    date_str = target_date.strftime("%d/%m/%Y")
-    day_label = "today" if is_today else "yesterday"
-    lines.append(f"{feeder.name} as @ {day_label} {date_str}")
-    
-    for on_time, off_time in cycles:
-        duration = off_time - on_time
-        total_supply += duration
+    # ------------------
+    # TASK 2: Real-time update format (is_today = True)
+    # ------------------
+    if is_today:
+        # Determine current status and when it started
+        current_status = "UNKNOWN"
+        current_since = None
         
-        on_str = format_time_dot(on_time)
-        off_str = format_time_dot(off_time)
-        dur_str = format_duration(duration)
+        with engine.connect() as conn:
+            recent_query = text("""
+                SELECT status, server_time 
+                FROM myapp_powerstatus 
+                WHERE feeder_id = :feeder_id 
+                ORDER BY server_time DESC 
+                LIMIT 50
+            """)
+            recent_updates = conn.execute(recent_query, {"feeder_id": feeder.id}).fetchall()
+            
+        if recent_updates:
+            current_status = recent_updates[0][0].upper()
+            current_since = recent_updates[0][1]
+            for status, s_time in recent_updates:
+                if status.upper() == current_status:
+                    current_since = s_time
+                else:
+                    break
+        elif pre_update:
+            current_status = pre_update[0].upper()
+            current_since = pre_update[1]
+            
+        # Determine last outage duration (if currently ON) or last supply duration (if currently OFF)
+        last_outage_duration = None
+        last_supply_duration = None
         
-        lines.append(f"Power on: {on_str}")
-        lines.append(f"Power off: {off_str}")
-        lines.append(f"Supply {dur_str}")
+        if current_status == "ON" and current_since:
+            last_off_time = None
+            last_off_start = None
+            for status, s_time in recent_updates:
+                status_upper = status.upper()
+                if s_time < current_since:
+                    if status_upper == "OFF":
+                        if last_off_time is None:
+                            last_off_time = s_time
+                        last_off_start = s_time
+                    elif status_upper == "ON" and last_off_time is not None:
+                        break
+            if last_off_start and current_since:
+                last_outage_duration = current_since - last_off_start
+                
+        elif current_status == "OFF" and current_since:
+            last_on_time = None
+            last_on_start = None
+            for status, s_time in recent_updates:
+                status_upper = status.upper()
+                if s_time < current_since:
+                    if status_upper == "ON":
+                        if last_on_time is None:
+                            last_on_time = s_time
+                        last_on_start = s_time
+                    elif status_upper == "OFF" and last_on_time is not None:
+                        break
+            if last_on_start and current_since:
+                last_supply_duration = current_since - last_on_start
+                
+        status_icon = "🟢" if current_status == "ON" else "🔴"
+        since_str = format_time_colon(current_since) if current_since else "N/A"
         
-    lines.append("")
-    total_supply_str = format_duration(total_supply)
-    lines.append(f"Total Supply {total_supply_str}")
-    
-    if not is_today:
-        total_outage = timedelta(hours=24) - total_supply
-        if total_outage < timedelta():
-            total_outage = timedelta()
-        total_outage_str = format_duration(total_outage)
-        lines.append(f"Total Outage  {total_outage_str}")
+        lines = []
+        band_part = f"  | Band {feeder.band}" if getattr(feeder, 'band', None) else ""
+        lines.append(f"⚡ *{feeder.name}{band_part}*")
+        lines.append(f"{status_icon} *Current Status*: {current_status}  since {since_str}")
         
-    return "\n".join(lines)
+        if current_status == "ON":
+            outage_dur_str = format_last_status_duration(last_outage_duration) if last_outage_duration else "N/A"
+            lines.append(f"⏱️ Last outage was {outage_dur_str}")
+        else:
+            supply_dur_str = format_last_status_duration(last_supply_duration) if last_supply_duration else "N/A"
+            lines.append(f"⏱️ Last supply was {supply_dur_str}")
+            
+        lines.append("")
+        lines.append("🔹 Supply Log")
+        for on_time, off_time in cycles:
+            duration = off_time - on_time
+            on_str = format_time_colon(on_time)
+            off_str = format_time_colon(off_time)
+            dur_str = format_supply_log_duration(duration)
+            lines.append(f"- Power On: {on_str} → Power Off: {off_str} | ⏱️ Supply: {dur_str}")
+            
+        return "\n".join(lines)
+
+    # ------------------
+    # TASK 3: End of Day report format (is_today = False)
+    # ------------------
+    else:
+        # Longest Supply
+        if cycles:
+            longest_supply_cycle = max(cycles, key=lambda c: c[1] - c[0])
+            longest_supply_dur = longest_supply_cycle[1] - longest_supply_cycle[0]
+            longest_supply_time = format_time_colon(longest_supply_cycle[0])
+        else:
+            longest_supply_dur = timedelta()
+            longest_supply_time = "N/A"
+            
+        # Longest Outage
+        valid_outages = [o for o in outages if o[1] - o[0] > timedelta()]
+        if not valid_outages and outages:
+            valid_outages = outages
+            
+        if valid_outages:
+            longest_outage_cycle = max(valid_outages, key=lambda o: o[1] - o[0])
+            longest_outage_dur = longest_outage_cycle[1] - longest_outage_cycle[0]
+            longest_outage_time = format_time_colon(longest_outage_cycle[0])
+        else:
+            longest_outage_dur = timedelta()
+            longest_outage_time = "N/A"
+            
+        # Average Supply
+        if cycles:
+            avg_supply_dur = total_supply / len(cycles)
+        else:
+            avg_supply_dur = timedelta()
+            
+        # Reliability Score
+        reliability_score = int(round((total_supply.total_seconds() / 86400.0) * 100))
+        
+        # Hashtags
+        tags = []
+        feeder_clean = re.sub(r'[^a-zA-Z0-9]', '', feeder.name.split()[0])
+        if feeder_clean:
+            tags.append(f"#{feeder_clean}")
+            
+        # Get transformer name from DB
+        transformer = None
+        with engine.connect() as conn:
+            t_query = text("SELECT transformer_name FROM myapp_feeder WHERE id = :feeder_id")
+            t_row = conn.execute(t_query, {"feeder_id": feeder.id}).fetchone()
+            if t_row and t_row[0]:
+                transformer = t_row[0]
+                
+        if transformer:
+            trans_clean = re.sub(r'[^a-zA-Z0-9]', '', transformer.split()[0])
+            if trans_clean and trans_clean not in tags:
+                tags.append(f"#{trans_clean}")
+        else:
+            tags.append("#Ayanngburen")
+            
+        tags.append("#PowerTracker")
+        hashtag_str = " ".join(tags)
+        
+        day_name = target_date.strftime("%A")
+        date_str = target_date.strftime("%d %B %Y")
+        
+        lines = []
+        band_part = f" ( Band {feeder.band} )" if getattr(feeder, 'band', None) else ""
+        lines.append("⚡ *Power Supply  Insight -Daily  Report ")
+        lines.append(f" {feeder.name} {band_part}")
+        lines.append("")
+        lines.append(f"📅 *{day_name}*: {date_str}")
+        lines.append("")
+        lines.append("")
+        lines.append("📊 * Supply Snippet *")
+        
+        total_uptime_str = format_duration_short(total_supply)
+        lines.append(f"├ Total Uptime: *{total_uptime_str}*")
+        lines.append(f"├ Total Outages: *{len(outages)}*")
+        
+        longest_supply_str = format_duration_short(longest_supply_dur)
+        lines.append(f"├ Longest Supply: *{longest_supply_str}* @ {longest_supply_time}")
+        
+        longest_outage_str = format_duration_short(longest_outage_dur)
+        lines.append(f"├ Longest Outage: *{longest_outage_str}* @ {longest_outage_time}")
+        
+        avg_supply_str = format_duration_short(avg_supply_dur)
+        lines.append(f"└ Avg Supply per Cycle: *{avg_supply_str}*")
+        lines.append("")
+        
+        lines.append(f"📈 *Reliability Score*: *{reliability_score}%* ")
+        lines.append(f"[{total_uptime_str} / 24h]")
+        lines.append("")
+        
+        lines.append("🔹 Supply Log")
+        for on_time, off_time in cycles:
+            duration = off_time - on_time
+            on_str = format_time_colon(on_time)
+            off_str = format_time_colon(off_time)
+            dur_str = format_supply_log_duration(duration)
+            lines.append(f"- Power On: {on_str} → Power Off: {off_str} | ⏱️ Supply: {dur_str}")
+            
+        lines.append("")
+        lines.append(hashtag_str)
+        
+        return "\n".join(lines)
 
 @celery_app.task(name="myapp.tasks.send_email_async")
 def send_email_async(subject, text_content, html_content, to_emails, from_email=None, tenant_id=None):
@@ -305,13 +549,13 @@ def send_power_email(feeder_name, status, device_time, server_time, contact_phon
     feeder = None
     try:
         with engine.begin() as conn:
-            feeder_query = text("SELECT id, name, contact_phone FROM myapp_feeder WHERE name = :name")
+            feeder_query = text("SELECT id, name, contact_phone, band FROM myapp_feeder WHERE name = :name")
             row = conn.execute(feeder_query, {"name": feeder_name}).fetchone()
             if not row:
                 insert_query = text("""
-                    INSERT INTO myapp_feeder (name, contact_phone, created_at)
-                    VALUES (:name, :contact_phone, :created_at)
-                    RETURNING id, name, contact_phone
+                    INSERT INTO myapp_feeder (name, contact_phone, band, created_at)
+                    VALUES (:name, :contact_phone, 'A', :created_at)
+                    RETURNING id, name, contact_phone, band
                 """)
                 row = conn.execute(insert_query, {
                     "name": feeder_name,
@@ -322,9 +566,9 @@ def send_power_email(feeder_name, status, device_time, server_time, contact_phon
                 if contact_phone and row[2] != contact_phone:
                     update_query = text("UPDATE myapp_feeder SET contact_phone = :phone WHERE id = :id")
                     conn.execute(update_query, {"phone": contact_phone, "id": row[0]})
-                    row = (row[0], row[1], contact_phone)
+                    row = (row[0], row[1], contact_phone, row[3])
             
-            feeder = FeederObj(row[0], row[1], row[2])
+            feeder = FeederObj(row[0], row[1], row[2], row[3])
     except Exception as e:
         logger.error(f"Error retrieving or creating Feeder: {e}", exc_info=True)
         feeder = FeederObj(0, feeder_name, contact_phone)
@@ -376,10 +620,10 @@ def send_daily_power_updates():
     feeders = []
     try:
         with engine.connect() as conn:
-            feeders_query = text("SELECT id, name, contact_phone FROM myapp_feeder")
+            feeders_query = text("SELECT id, name, contact_phone, band FROM myapp_feeder")
             rows = conn.execute(feeders_query).fetchall()
             for r in rows:
-                feeders.append(FeederObj(r[0], r[1], r[2]))
+                feeders.append(FeederObj(r[0], r[1], r[2], r[3]))
     except Exception as e:
         logger.error(f"Error fetching Feeders: {e}", exc_info=True)
         
