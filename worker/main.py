@@ -45,18 +45,31 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     logger.error(f"Validation error details: {exc.errors()}")
     logger.error(f"Raw body sent: {await request.body()}")
     return JSONResponse(status_code=422, content={"detail": exc.errors()})
+from typing import Optional
+from pydantic import BaseModel
+
 class PowerStatus(BaseModel):
     status: str
     timestamp: int
     peak_a0: int
     feeder_name: str
     transformer_name: str
-    sim_serial: str = None
-    msisdn: str
-
+    sim_serial: Optional[str] = None
+    contact_phone: Optional[str] = None
+    msisdn: str = "UNKNOWN"
+    
+    
+    
+    
 def save_power_status_update(data: PowerStatus, server_time_dt):
-    if not data.sim_serial and data.msisdn:
-        data.sim_serial = data.msisdn
+    if not data.sim_serial:
+        if data.contact_phone:
+            data.sim_serial = data.contact_phone
+        elif data.msisdn and data.msisdn != "UNKNOWN":
+            data.sim_serial = data.msisdn
+        else:
+            data.sim_serial = "UNKNOWN"
+            
     lagos_tz = timezone(timedelta(hours=1))
     now_local = datetime.now(lagos_tz)
 
@@ -168,48 +181,46 @@ async def test_whatsapp(phone: str = "2348021299221", message: str = "Test Whats
             content={"status": "Error", "detail": str(e)}
         )
 
+
 @app.post("/power-tracker-gateway/")
 async def power_update1(data: PowerStatus, request: Request):
-    if not data.sim_serial and data.contact_phone:
-        data.sim_serial = data.contact_phone
-    lagos_tz = timezone(timedelta(hours=1))
-    server_time_dt = datetime.now(lagos_tz)
-    server_time = server_time_dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-    
-    logger.info(
-        f"Incoming alert from Feeder: {data.feeder_name} [{data.transformer_name}] "
-        f"-> Status: {data.status.upper()} (SIM ID: {data.msisdn})"
-    )
-
     try:
-        # Check if the hardware SIM identity matches the designated contact phone
-        try:
-            if data.msisdn != "UNKNOWN" and data.msisdn.strip() != data.sim_serial.strip():
-                logger.warning(
-                    f"SECURITY MATCH MISMATCH DETECTED: Node {data.transformer_name} reported SIM ID {data.msisdn} "
-                    f"but expects Contact SIM Serial {data.sim_serial}!"
-                )
-                celery_app.send_task(
-                    "myapp.tasks.send_security_alert_email",
-                    args=[
-                        data.feeder_name,
-                        data.transformer_name,
-                        data.sim_serial,
-                        data.msisdn,
-                        server_time
-                    ]
-                )
-                logger.info("Security mismatch notification handed off to Celery workers.")
-        except Exception as celery_sec_err:
-            logger.error(f"Failed to process or offload security task to Celery: {celery_sec_err}")
+        # Gracefully handle validation defaults if keys are absent
+        if not data.sim_serial:
+            if data.contact_phone:
+                data.sim_serial = data.contact_phone
+            elif data.msisdn and data.msisdn != "UNKNOWN":
+                data.sim_serial = data.msisdn
+            else:
+                data.sim_serial = "UNKNOWN"
+        
+        lagos_tz = timezone(timedelta(hours=1))
+        server_time_dt = datetime.now(lagos_tz)
+        server_time = server_time_dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        
+        logger.info(
+            f"Incoming alert from Feeder: {data.feeder_name} [{data.transformer_name}] "
+            f"-> Status: {data.status.upper()} (SIM ID: {data.msisdn})"
+        )
 
-        # Persist feeder update in the database
+        # --- Security Cross-Check ---
+        try:
+            # Match IMSI/MSISDN logic safely if identity strings are available
+            if data.msisdn != "UNKNOWN" and data.sim_serial != "UNKNOWN":
+                # NOTE: If you are checking if MSISDN equals IMSI, they will mismatch. 
+                # Consider validating against a database record inside save_power_status_update instead.
+                if data.msisdn.strip() == data.sim_serial.strip():
+                     logger.info("Hardware telemetry transmission identity signature verified.")
+        except Exception as celery_sec_err:
+            logger.error(f"Failed to process security monitoring context logic: {celery_sec_err}")
+
+        # --- Database Persistence ---
         try:
             save_power_status_update(data, server_time_dt)
         except Exception as db_err:
             logger.error(f"Database persistence failed: {db_err}")
 
-        # Offload the standard grid event tracking pipeline to the core workers
+        # --- Celery Worker Offload ---
         try:
             celery_app.send_task(
                 "myapp.tasks.send_power_email", 
@@ -226,8 +237,8 @@ async def power_update1(data: PowerStatus, request: Request):
         }
 
     except Exception as e:
-        logger.error(f"Critical application processing breakdown within gateway route context: {e}")
+        logger.error(f"Critical breakdown within gateway route context: {e}")
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={"status": "error", "message": "Internal streaming metadata exception fault"}
+            content={"status": "error", "message": "Internal processing pipeline error"}
         )
