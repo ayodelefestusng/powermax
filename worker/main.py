@@ -52,12 +52,11 @@ class PowerStatus(BaseModel):
     feeder_name: str
     transformer_name: str
     sim_serial: str = None
-    contact_phone: str = None
     msisdn: str
 
 def save_power_status_update(data: PowerStatus, server_time_dt):
-    if not data.sim_serial and data.contact_phone:
-        data.sim_serial = data.contact_phone
+    if not data.sim_serial and data.msisdn:
+        data.sim_serial = data.msisdn
     lagos_tz = timezone(timedelta(hours=1))
     now_local = datetime.now(lagos_tz)
 
