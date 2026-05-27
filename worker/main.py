@@ -8,7 +8,7 @@ from sqlalchemy import text
 
 from worker.celery_app import celery_app
 from worker.db import engine
-from worker.tasks import send_whatsapp_power_message
+from worker.tasks import send_whatsapp_power_message, generate_power_report, FeederObj
 
 # Logger configuration
 # logging.basicConfig(level=logging.INFO)
@@ -131,55 +131,182 @@ def save_power_status_update(data: PowerStatus, server_time_dt):
         raise e
 
 @app.get("/api/test-email/")
-async def test_email():
+async def test_email(
+    feeder_name: str = "Ayangbunren",
+    contact_phone: str = "2348021299221"
+):
     logger.info("Test email endpoint called")
-    feeder_name = "Test Feeder"
-    test_status = "ON"
-    test_ms = 9999
-    
+    # Fetch Feeder from DB
+    feeder = None
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT id, name, registered_phone, band FROM myapp_feeder WHERE name = :name"),
+                {"name": feeder_name}
+            ).fetchone()
+            if row:
+                feeder = FeederObj(row[0], row[1], row[2], row[3])
+    except Exception as db_err:
+        logger.error(f"Failed to fetch feeder for test_email: {db_err}")
+        
+    if not feeder:
+        feeder = FeederObj(0, feeder_name, contact_phone, "A")
+        
     lagos_tz = timezone(timedelta(hours=1))
+    today_date = datetime.now(lagos_tz).date()
     server_time = datetime.now(lagos_tz).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-    contact_phone = "2348027790963"
     
+    # Generate the power report body
+    report_body = "Failed to generate report"
+    try:
+        report_body = generate_power_report(feeder, today_date, is_today=True)
+    except Exception as rep_err:
+        logger.error(f"Failed to generate report in test_email: {rep_err}")
+        
+    # Send email Celery task
     try:
         celery_app.send_task(
             "myapp.tasks.send_power_email", 
-            args=[feeder_name, test_status, test_ms, server_time, contact_phone]
+            args=[feeder.name, "ON", 9999, server_time, contact_phone]
         )
-        return {
-            "status": "Success",
-            "message": "Test email task sent to Celery queue",
-            "server_time": server_time
-        }
     except Exception as e:
-        logger.error(f"Failed to enqueue test email: {e}")
-        return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={"status": "Error", "detail": str(e)}
-        )
-
-@app.get("/api/test-whatsapp/")
-async def test_whatsapp(phone: str = "2348021299221", message: str = "Test WhatsApp message from FastAPI"):
-    logger.info(f"Test WhatsApp endpoint called for phone: {phone}")
+        logger.error(f"Failed to enqueue test email task: {e}")
+        
+    # Send WhatsApp message
+    whatsapp_status = "Failed"
     try:
-        res = send_whatsapp_power_message(phone, message)
+        res = send_whatsapp_power_message(contact_phone, report_body)
         if res:
-            return {
-                "status": "Success",
-                "message": "Test WhatsApp message sent",
-                "response": res
-            }
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to send WhatsApp message"
-            )
-    except Exception as e:
-        logger.error(f"Failed to send test WhatsApp: {e}")
-        return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={"status": "Error", "detail": str(e)}
+            whatsapp_status = "Sent"
+    except Exception as wa_err:
+        logger.error(f"Failed to send test WhatsApp message: {wa_err}")
+        
+    return {
+        "status": "Success",
+        "message": "Test email task sent to Celery queue",
+        "whatsapp_status": whatsapp_status,
+        "report_generated": report_body,
+        "server_time": server_time
+    }
+
+@app.get("/api/test-power-email/")
+async def test_power_email(
+    feeder_name: str = "Erunwen Feeder",
+    status: str = "ON",
+    device_time: int = 1234567,
+    contact_phone: str = "2348021299221"
+):
+    logger.info(f"Test power email endpoint called for feeder: {feeder_name}")
+    
+    # Fetch Feeder from DB
+    feeder = None
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT id, name, registered_phone, band FROM myapp_feeder WHERE name = :name"),
+                {"name": feeder_name}
+            ).fetchone()
+            if row:
+                feeder = FeederObj(row[0], row[1], row[2], row[3])
+    except Exception as db_err:
+        logger.error(f"Failed to fetch feeder for test_power_email: {db_err}")
+        
+    if not feeder:
+        feeder = FeederObj(0, feeder_name, contact_phone, "A")
+        
+    lagos_tz = timezone(timedelta(hours=1))
+    today_date = datetime.now(lagos_tz).date()
+    server_time = datetime.now(lagos_tz).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    
+    # Generate the power report body
+    report_body = "Failed to generate report"
+    try:
+        report_body = generate_power_report(feeder, today_date, is_today=True)
+    except Exception as rep_err:
+        logger.error(f"Failed to generate report in test_power_email: {rep_err}")
+        
+    # Send power email Celery task
+    try:
+        celery_app.send_task(
+            "myapp.tasks.send_power_email", 
+            args=[feeder.name, status, device_time, server_time, contact_phone]
         )
+    except Exception as e:
+        logger.error(f"Failed to enqueue test power email: {e}")
+        
+    # Send WhatsApp message
+    whatsapp_status = "Failed"
+    try:
+        res = send_whatsapp_power_message(contact_phone, report_body)
+        if res:
+            whatsapp_status = "Sent"
+    except Exception as wa_err:
+        logger.error(f"Failed to send test WhatsApp message: {wa_err}")
+
+    return {
+        "status": "Success",
+        "message": f"Test power email task for {feeder.name} sent to Celery queue",
+        "whatsapp_status": whatsapp_status,
+        "report_generated": report_body,
+        "server_time": server_time
+    }
+
+@app.get("/api/test-daily-power-updates/")
+async def test_daily_power_updates():
+    logger.info("Test daily power updates endpoint called")
+    
+    lagos_tz = timezone(timedelta(hours=1))
+    yesterday = (datetime.now(lagos_tz) - timedelta(days=1)).date()
+    
+    feeders = []
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("SELECT id, name, registered_phone, band FROM myapp_feeder")).fetchall()
+            for r in rows:
+                feeders.append(FeederObj(r[0], r[1], r[2], r[3]))
+    except Exception as e:
+        logger.error(f"Error fetching Feeders for test_daily_power_updates: {e}", exc_info=True)
+        
+    reports_sent = []
+    
+    for feeder in feeders:
+        try:
+            report_body = generate_power_report(feeder, yesterday, is_today=False)
+            phone_to_use = feeder.contact_phone
+            whatsapp_status = "Skipped (No phone)"
+            if phone_to_use:
+                try:
+                    res = send_whatsapp_power_message(phone_to_use, report_body)
+                    if res:
+                        whatsapp_status = "Sent"
+                    else:
+                        whatsapp_status = "Failed"
+                except Exception as wa_err:
+                    whatsapp_status = f"Error: {wa_err}"
+            
+            reports_sent.append({
+                "feeder_name": feeder.name,
+                "phone": phone_to_use,
+                "whatsapp_status": whatsapp_status,
+                "report_preview": report_body[:100] + "..." if len(report_body) > 100 else report_body
+            })
+        except Exception as err:
+            reports_sent.append({
+                "feeder_name": feeder.name,
+                "error": str(err)
+            })
+            
+    # Trigger the Celery task to run completely in the background
+    try:
+        celery_app.send_task("myapp.tasks.send_daily_power_updates")
+    except Exception as e:
+        logger.error(f"Failed to enqueue test daily power updates: {e}")
+        
+    return {
+        "status": "Success",
+        "message": "Test daily power updates task sent to Celery queue",
+        "reports_processed": reports_sent
+    }
 
 
 @app.post("/power-tracker-gateway/")
