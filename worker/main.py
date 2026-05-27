@@ -35,6 +35,16 @@ logger.addHandler(file_handler)
 
 app = FastAPI(title="FastAPI Worker Gateway API")
 
+
+
+from fastapi.exceptions import RequestValidationError
+from fastapi import Request
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    logger.error(f"Validation error details: {exc.errors()}")
+    logger.error(f"Raw body sent: {await request.body()}")
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
 class PowerStatus(BaseModel):
     status: str
     timestamp: int
@@ -98,7 +108,7 @@ def save_power_status_update(data: PowerStatus, server_time_dt):
                 "timestamp": data.timestamp,
                 "peak_a0": data.peak_a0,
                 "server_time": server_time_dt,
-                "sim_serial": data.msisdn,  # using msisdn as the SIM identifier
+                "sim_serial": data.sim_serial,  # using sim_serial as the SIM identifier
                 "msisdn": data.msisdn,
             })
             logger.info(f"Persisted power status update in database for feeder {data.feeder_name}")
