@@ -41,7 +41,8 @@ class PowerStatus(BaseModel):
     peak_a0: int
     feeder_name: str
     transformer_name: str
-    contact_phone: str
+    # Renamed from registered_phone to sim_serial (holds the SIM identifier)
+    sim_serial: str
     msisdn: str
 
 def save_power_status_update(data: PowerStatus, server_time_dt):
@@ -51,43 +52,45 @@ def save_power_status_update(data: PowerStatus, server_time_dt):
     try:
         with engine.begin() as conn:
             # Check if feeder exists
-            feeder_query = text("SELECT id, transformer_name, contact_phone, msisdn FROM myapp_feeder WHERE name = :name")
+            # Note: Feeder table now uses `registered_phone` instead of `contact_phone`
+            feeder_query = text("SELECT id, transformer_name, sim_serial, msisdn FROM myapp_feeder WHERE name = :name")
             feeder = conn.execute(feeder_query, {"name": data.feeder_name}).fetchone()
             
             if not feeder:
                 # Create feeder
                 insert_feeder_query = text("""
-                    INSERT INTO myapp_feeder (name, transformer_name, contact_phone, msisdn, created_at)
-                    VALUES (:name, :transformer_name, :contact_phone, :msisdn, :created_at)
+                    INSERT INTO myapp_feeder (name, transformer_name, sim_serial, msisdn, created_at)
+                    VALUES (:name, :transformer_name, :sim_serial, :msisdn, :created_at)
                     RETURNING id
                 """)
                 feeder_id = conn.execute(insert_feeder_query, {
                     "name": data.feeder_name,
                     "transformer_name": data.transformer_name,
-                    "contact_phone": data.contact_phone,
+                    "sim_serial": data.sim_serial,
                     "msisdn": data.msisdn,
                     "created_at": now_local
                 }).scalar()
             else:
                 feeder_id = feeder[0]
                 # Update feeder fields if they changed
-                if feeder[1] != data.transformer_name or feeder[2] != data.contact_phone or feeder[3] != data.msisdn:
+                if feeder[1] != data.transformer_name or feeder[2] != data.sim_serial or feeder[3] != data.msisdn:
                     update_feeder_query = text("""
                         UPDATE myapp_feeder
-                        SET transformer_name = :transformer_name, contact_phone = :contact_phone, msisdn = :msisdn
+                        SET transformer_name = :transformer_name, sim_serial = :sim_serial, msisdn = :msisdn
                         WHERE id = :id
                     """)
                     conn.execute(update_feeder_query, {
                         "transformer_name": data.transformer_name,
-                        "contact_phone": data.contact_phone,
+                        "sim_serial": data.sim_serial,
                         "msisdn": data.msisdn,
                         "id": feeder_id
                     })
             
             # Save power status
+            # PowerStatus now stores `sim_serial` instead of `contact_phone`
             insert_status_query = text("""
-                INSERT INTO myapp_powerstatus (feeder_id, status, timestamp, peak_a0, server_time, contact_phone, msisdn)
-                VALUES (:feeder_id, :status, :timestamp, :peak_a0, :server_time, :contact_phone, :msisdn)
+                INSERT INTO myapp_powerstatus (feeder_id, status, timestamp, peak_a0, server_time, sim_serial, msisdn)
+                VALUES (:feeder_id, :status, :timestamp, :peak_a0, :server_time, :sim_serial, :msisdn)
             """)
             conn.execute(insert_status_query, {
                 "feeder_id": feeder_id,
@@ -95,8 +98,8 @@ def save_power_status_update(data: PowerStatus, server_time_dt):
                 "timestamp": data.timestamp,
                 "peak_a0": data.peak_a0,
                 "server_time": server_time_dt,
-                "contact_phone": data.contact_phone,
-                "msisdn": data.msisdn
+                "sim_serial": data.msisdn,  # using msisdn as the SIM identifier
+                "msisdn": data.msisdn,
             })
             logger.info(f"Persisted power status update in database for feeder {data.feeder_name}")
     except Exception as e:
@@ -168,7 +171,7 @@ async def power_update1(data: PowerStatus, request: Request):
     try:
         # Check if the hardware SIM identity matches the designated contact phone
         try:
-            if data.msisdn != "UNKNOWN" and data.msisdn.strip() != data.contact_phone.strip():
+            if data.msisdn != "UNKNOWN" and data.msisdn.strip() != data.sim_serial.strip():
                 logger.warning(
                     f"SECURITY MATCH MISMATCH DETECTED: Node {data.transformer_name} reported SIM ID {data.msisdn} "
                     f"but expects Contact Profile Phone {data.contact_phone}!"
@@ -178,7 +181,7 @@ async def power_update1(data: PowerStatus, request: Request):
                     args=[
                         data.feeder_name,
                         data.transformer_name,
-                        data.contact_phone,
+                        data.sim_serial,
                         data.msisdn,
                         server_time
                     ]
@@ -197,7 +200,7 @@ async def power_update1(data: PowerStatus, request: Request):
         try:
             celery_app.send_task(
                 "myapp.tasks.send_power_email", 
-                args=[data.feeder_name, data.status, data.timestamp, server_time, data.contact_phone]
+                args=[data.feeder_name, data.status, data.timestamp, server_time, data.sim_serial]
             )
             logger.info("Grid status metric tracking update successfully offloaded to queue.")
         except Exception as celery_err:
