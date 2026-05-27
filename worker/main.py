@@ -40,11 +40,23 @@ app = FastAPI(title="FastAPI Worker Gateway API")
 from fastapi.exceptions import RequestValidationError
 from fastapi import Request
 
+def _clean_validation_error(err):
+    if isinstance(err, dict):
+        return {k: _clean_validation_error(v) for k, v in err.items()}
+    elif isinstance(err, (list, tuple)):
+        return [_clean_validation_error(item) for item in err]
+    elif isinstance(err, bytes):
+        return err.decode("utf-8", errors="replace")
+    elif isinstance(err, (str, int, float, bool, type(None))):
+        return err
+    return repr(err)
+
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     logger.error(f"Validation error details: {exc.errors()}")
     logger.error(f"Raw body sent: {await request.body()}")
-    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+    cleaned_errors = _clean_validation_error(exc.errors())
+    return JSONResponse(status_code=422, content={"detail": cleaned_errors})
 from typing import Optional
 from pydantic import BaseModel
 
