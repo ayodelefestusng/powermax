@@ -549,22 +549,22 @@ def send_power_email(feeder_name, status, device_time, server_time, contact_phon
     feeder = None
     try:
         with engine.begin() as conn:
-            feeder_query = text("SELECT id, name, contact_phone, band FROM myapp_feeder WHERE name = :name")
+            feeder_query = text("SELECT id, name, registered_phone, band FROM myapp_feeder WHERE name = :name")
             row = conn.execute(feeder_query, {"name": feeder_name}).fetchone()
             if not row:
                 insert_query = text("""
-                    INSERT INTO myapp_feeder (name, contact_phone, band, created_at)
-                    VALUES (:name, :contact_phone, 'A', :created_at)
-                    RETURNING id, name, contact_phone, band
+                    INSERT INTO myapp_feeder (name, registered_phone, band, created_at)
+                    VALUES (:name, :registered_phone, 'A', :created_at)
+                    RETURNING id, name, registered_phone, band
                 """)
                 row = conn.execute(insert_query, {
                     "name": feeder_name,
-                    "contact_phone": contact_phone,
+                    "registered_phone": contact_phone,
                     "created_at": datetime.now()
                 }).fetchone()
             else:
                 if contact_phone and row[2] != contact_phone:
-                    update_query = text("UPDATE myapp_feeder SET contact_phone = :phone WHERE id = :id")
+                    update_query = text("UPDATE myapp_feeder SET registered_phone = :phone WHERE id = :id")
                     conn.execute(update_query, {"phone": contact_phone, "id": row[0]})
                     row = (row[0], row[1], contact_phone, row[3])
             
@@ -620,7 +620,7 @@ def send_daily_power_updates():
     feeders = []
     try:
         with engine.connect() as conn:
-            feeders_query = text("SELECT id, name, contact_phone, band FROM myapp_feeder")
+            feeders_query = text("SELECT id, name, registered_phone, band FROM myapp_feeder")
             rows = conn.execute(feeders_query).fetchall()
             for r in rows:
                 feeders.append(FeederObj(r[0], r[1], r[2], r[3]))

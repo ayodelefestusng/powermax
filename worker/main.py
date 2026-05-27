@@ -51,11 +51,13 @@ class PowerStatus(BaseModel):
     peak_a0: int
     feeder_name: str
     transformer_name: str
-    # Renamed from registered_phone to sim_serial (holds the SIM identifier)
-    sim_serial: str
+    sim_serial: str = None
+    contact_phone: str = None
     msisdn: str
 
 def save_power_status_update(data: PowerStatus, server_time_dt):
+    if not data.sim_serial and data.contact_phone:
+        data.sim_serial = data.contact_phone
     lagos_tz = timezone(timedelta(hours=1))
     now_local = datetime.now(lagos_tz)
 
@@ -169,6 +171,8 @@ async def test_whatsapp(phone: str = "2348021299221", message: str = "Test Whats
 
 @app.post("/power-tracker-gateway/")
 async def power_update1(data: PowerStatus, request: Request):
+    if not data.sim_serial and data.contact_phone:
+        data.sim_serial = data.contact_phone
     lagos_tz = timezone(timedelta(hours=1))
     server_time_dt = datetime.now(lagos_tz)
     server_time = server_time_dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
