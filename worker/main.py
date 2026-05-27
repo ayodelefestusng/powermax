@@ -174,7 +174,7 @@ async def power_update1(data: PowerStatus, request: Request):
             if data.msisdn != "UNKNOWN" and data.msisdn.strip() != data.sim_serial.strip():
                 logger.warning(
                     f"SECURITY MATCH MISMATCH DETECTED: Node {data.transformer_name} reported SIM ID {data.msisdn} "
-                    f"but expects Contact Profile Phone {data.contact_phone}!"
+                    f"but expects Contact SIM Serial {data.sim_serial}!"
                 )
                 celery_app.send_task(
                     "myapp.tasks.send_security_alert_email",
