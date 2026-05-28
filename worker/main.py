@@ -58,19 +58,21 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     cleaned_errors = _clean_validation_error(exc.errors())
     return JSONResponse(status_code=422, content={"detail": cleaned_errors})
 from typing import Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 class PowerStatus(BaseModel):
     status: str
     timestamp: int
     peak_a0: int
     feeder_name: str
-    transformer_name: str
-    sim_serial: Optional[str] = None
+    # Use Field aliases to match incoming variations or guarantee a fallback default
+    transformer_name: str = Field(default="UNKNOWN_TRANSFORMER", alias="transformer")
+    sim_serial: Optional[str] = "UNKNOWN"
     contact_phone: Optional[str] = None
     msisdn: str = "UNKNOWN"
-    
-    
+
+    class Config:
+        populate_by_name = True  # Allows parsing both alias and field name keys
     
     
 def save_power_status_update(data: PowerStatus, server_time_dt):
@@ -324,18 +326,17 @@ async def test_daily_power_updates():
 @app.post("/power-tracker-gateway/")
 async def power_update1(data: PowerStatus, request: Request):
     try:
-        # Gracefully handle validation defaults if keys are absent
-        if not data.sim_serial:
+        # Gracefully handle validation defaults if keys are absent or marked as UNKNOWN
+        if not data.sim_serial or data.sim_serial == "UNKNOWN":
             if data.contact_phone:
                 data.sim_serial = data.contact_phone
             elif data.msisdn and data.msisdn != "UNKNOWN":
                 data.sim_serial = data.msisdn
             else:
                 data.sim_serial = "UNKNOWN"
-        
         lagos_tz = timezone(timedelta(hours=1))
         server_time_dt = datetime.now(lagos_tz)
-        server_time = server_time_dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        server_time = server_time_dt.strftime("%Y-%m-%d %H:%M:%S") + f".{int(server_time_dt.microsecond / 1000):03d}"
         
         logger.info(
             f"Incoming alert from Feeder: {data.feeder_name} [{data.transformer_name}] "
