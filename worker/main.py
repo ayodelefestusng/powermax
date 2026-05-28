@@ -97,8 +97,8 @@ def save_power_status_update(data: PowerStatus, server_time_dt):
             if not feeder:
                 # Create feeder
                 insert_feeder_query = text("""
-                    INSERT INTO myapp_feeder (name, transformer_name, sim_serial, msisdn, created_at)
-                    VALUES (:name, :transformer_name, :sim_serial, :msisdn, :created_at)
+                    INSERT INTO myapp_feeder (name, transformer_name, sim_serial, msisdn, band, created_at)
+                    VALUES (:name, :transformer_name, :sim_serial, :msisdn, 'A', :created_at)
                     RETURNING id
                 """)
                 feeder_id = conn.execute(insert_feeder_query, {
@@ -382,3 +382,5 @@ async def power_update1(data: PowerStatus, request: Request):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content={"status": "error", "message": "Internal processing pipeline error"}
         )
+        
+    
