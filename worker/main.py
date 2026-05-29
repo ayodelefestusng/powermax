@@ -37,6 +37,8 @@ app = FastAPI(title="FastAPI Worker Gateway API")
 
 
 
+from fastapi.responses import PlainTextResponse, Response
+
 from fastapi.exceptions import RequestValidationError
 from fastapi import Request
 from typing import Optional
@@ -391,8 +393,6 @@ async def test_daily_power_updates():
         "reports_processed": reports_sent
     }
 
-
-from fastapi.responses import PlainTextResponse, Response
 
 @app.get("/robots.txt")
 async def robots():
