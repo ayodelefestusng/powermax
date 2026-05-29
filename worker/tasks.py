@@ -542,38 +542,60 @@ def send_test_email1():
     )
 
 @celery_app.task(name="myapp.tasks.send_power_email")
-def send_power_email(feeder_name, status, device_time, server_time, contact_phone=None):
+def send_power_email(feeder_name, status, device_time, server_time, contact_phone=None, transformer_name="UNKNOWN_TRANSFORMER", peak_a0=0, msisdn="UNKNOWN", sim_serial="UNKNOWN"):
     logger.info(f"Processing real-time power update for Feeder {feeder_name} with status {status}")
     
-    # 1. Fetch/Create Feeder
+    # 1. Database Persistence
     feeder = None
     try:
-        with engine.begin() as conn:
-            feeder_query = text("SELECT id, name, registered_phone, band FROM myapp_feeder WHERE name = :name")
-            row = conn.execute(feeder_query, {"name": feeder_name}).fetchone()
-            if not row:
-                insert_query = text("""
-                    INSERT INTO myapp_feeder (name, registered_phone, band, created_at)
-                    VALUES (:name, :registered_phone, 'A', :created_at)
-                    RETURNING id, name, registered_phone, band
-                """)
-                row = conn.execute(insert_query, {
-                    "name": feeder_name,
-                    "registered_phone": contact_phone,
-                    "created_at": datetime.now()
-                }).fetchone()
+        from worker.main import save_power_status_update, PowerStatus
+        
+        # Parse server_time string to datetime object (timezone-aware)
+        lagos_tz = pytz.timezone("Africa/Lagos")
+        try:
+            server_time_dt = datetime.strptime(server_time, "%Y-%m-%d %H:%M:%S.%f")
+        except ValueError:
+            try:
+                server_time_dt = datetime.strptime(server_time, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                server_time_dt = datetime.now()
+        
+        if server_time_dt.tzinfo is None:
+            server_time_dt = lagos_tz.localize(server_time_dt)
+
+        # Construct PowerStatus object
+        data = PowerStatus(
+            status=status,
+            timestamp=int(device_time),
+            peak_a0=int(peak_a0),
+            feeder_name=feeder_name,
+            transformer_name=transformer_name,
+            sim_serial=sim_serial if sim_serial != "UNKNOWN" else (contact_phone or "UNKNOWN"),
+            contact_phone=contact_phone,
+            msisdn=msisdn
+        )
+        
+        # Save power status and get feeder_id
+        feeder_id = save_power_status_update(data, server_time_dt)
+        
+        # Retrieve the updated Feeder details for reporting
+        with engine.connect() as conn:
+            feeder_query = text("SELECT id, name, registered_phone, band FROM myapp_feeder WHERE id = :id")
+            row = conn.execute(feeder_query, {"id": feeder_id}).fetchone()
+            if row:
+                feeder = FeederObj(row[0], row[1], row[2], row[3])
             else:
-                if contact_phone and row[2] != contact_phone:
-                    update_query = text("UPDATE myapp_feeder SET registered_phone = :phone WHERE id = :id")
-                    conn.execute(update_query, {"phone": contact_phone, "id": row[0]})
-                    row = (row[0], row[1], contact_phone, row[3])
-            
-            feeder = FeederObj(row[0], row[1], row[2], row[3])
-    except Exception as e:
-        logger.error(f"Error retrieving or creating Feeder: {e}", exc_info=True)
-        feeder = FeederObj(0, feeder_name, contact_phone)
+                feeder = FeederObj(feeder_id, feeder_name, contact_phone)
+                
+    except Exception as db_err:
+        logger.error(f"Database persistence failed, task will be retried: {db_err}", exc_info=True)
+        # Allow Celery to retry by propagating the exception
+        raise db_err
 
     # 2. Reconstruct today's log cycles report
+    if feeder is None:
+        feeder = FeederObj(0, feeder_name, contact_phone)
+        
     try:
         lagos_tz = pytz.timezone("Africa/Lagos")
         today_date = datetime.now(lagos_tz).date()
@@ -583,19 +605,19 @@ def send_power_email(feeder_name, status, device_time, server_time, contact_phon
         body = f"{feeder_name} status is {status}\nServer time: {server_time}"
 
     # 3. Send Email Alert
-    gmail_user = os.getenv("GMAIL_USER") or "upwardwave.dignity@gmail.com"
-    gmail_password = os.getenv("GMAIL_APP_PASSWORD") or "ybccjzqmxxlalaal"
-    to_email = os.getenv("ALERT_RECIPIENT") or "ayodelefestusng@gmail.com"
-
-    subject = f"ALERT: Grid Power is {status.upper()} - {feeder_name}"
-
-    msg = MIMEMultipart()
-    msg['From'] = gmail_user
-    msg['To'] = to_email
-    msg['Subject'] = subject
-    msg.attach(MIMEText(body, 'plain'))
-
     try:
+        gmail_user = os.getenv("GMAIL_USER") or "upwardwave.dignity@gmail.com"
+        gmail_password = os.getenv("GMAIL_APP_PASSWORD") or "ybccjzqmxxlalaal"
+        to_email = os.getenv("ALERT_RECIPIENT") or "ayodelefestusng@gmail.com"
+
+        subject = f"ALERT: Grid Power is {status.upper()} - {feeder_name}"
+
+        msg = MIMEMultipart()
+        msg['From'] = gmail_user
+        msg['To'] = to_email
+        msg['Subject'] = subject
+        msg.attach(MIMEText(body, 'plain'))
+
         with smtplib.SMTP_SSL('smtp.gmail.com', 465, timeout=15) as server:
             server.login(gmail_user, gmail_password)
             server.sendmail(gmail_user, to_email, msg.as_string())
@@ -604,11 +626,14 @@ def send_power_email(feeder_name, status, device_time, server_time, contact_phon
         logger.error(f"Failed to send email alert for Feeder {feeder_name}: {e}", exc_info=True)
 
     # 4. Send WhatsApp Alert
-    phone_to_use = contact_phone or feeder.contact_phone
-    if phone_to_use:
-        send_whatsapp_power_message(phone_to_use, body)
-    else:
-        logger.warning(f"No contact phone available to send WhatsApp message for Feeder {feeder_name}")
+    try:
+        phone_to_use = contact_phone or feeder.contact_phone
+        if phone_to_use:
+            send_whatsapp_power_message(phone_to_use, body)
+        else:
+            logger.warning(f"No contact phone available to send WhatsApp message for Feeder {feeder_name}")
+    except Exception as e:
+        logger.error(f"Failed to send WhatsApp power alert (Evolution API dispatch failed): {e}", exc_info=True)
 
 @celery_app.task(name="myapp.tasks.send_daily_power_updates")
 def send_daily_power_updates():
