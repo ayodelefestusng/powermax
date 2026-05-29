@@ -39,6 +39,8 @@ app = FastAPI(title="FastAPI Worker Gateway API")
 
 from fastapi.exceptions import RequestValidationError
 from fastapi import Request
+from typing import Optional
+from pydantic import BaseModel, Field
 
 
 def _clean_validation_error(err):
@@ -58,8 +60,6 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     logger.error(f"Raw body sent: {await request.body()}")
     cleaned_errors = _clean_validation_error(exc.errors())
     return JSONResponse(status_code=422, content={"detail": cleaned_errors})
-from typing import Optional
-from pydantic import BaseModel, Field
 
 class PowerStatus(BaseModel):
     status: str
@@ -146,6 +146,73 @@ def save_power_status_update(data: PowerStatus, server_time_dt):
         logger.error(f"Error persisting power status update for feeder {data.feeder_name}: {e}", exc_info=True)
         raise e
 
+
+@app.post("/power-tracker-gateway/")
+async def power_update1(data: PowerStatus, request: Request):
+    try:
+        # Gracefully handle validation defaults if keys are absent or marked as UNKNOWN
+        if not data.sim_serial or data.sim_serial == "UNKNOWN":
+            if data.contact_phone:
+                data.sim_serial = data.contact_phone
+            elif data.msisdn and data.msisdn != "UNKNOWN":
+                data.sim_serial = data.msisdn
+            else:
+                data.sim_serial = "UNKNOWN"
+        lagos_tz = timezone(timedelta(hours=1))
+        server_time_dt = datetime.now(lagos_tz)
+        server_time = server_time_dt.strftime("%Y-%m-%d %H:%M:%S") + f".{int(server_time_dt.microsecond / 1000):03d}"
+        
+        logger.info(
+            f"Incoming alert from Feeder: {data.feeder_name} [{data.transformer_name}] "
+            f"-> Status: {data.status.upper()} (SIM ID: {data.msisdn})"
+        )
+
+        # --- Security Cross-Check ---
+        try:
+            # Match IMSI/MSISDN logic safely if identity strings are available
+            if data.msisdn != "UNKNOWN" and data.sim_serial != "UNKNOWN":
+                # NOTE: If you are checking if MSISDN equals IMSI, they will mismatch. 
+                # Consider validating against a database record inside save_power_status_update instead.
+                if data.msisdn.strip() == data.sim_serial.strip():
+                    logger.info("Hardware telemetry transmission identity signature verified.")
+        except Exception as celery_sec_err:
+            logger.error(f"Failed to process security monitoring context logic: {celery_sec_err}")
+
+        # --- Celery Worker Offload ---
+        try:
+            celery_app.send_task(
+                "myapp.tasks.send_power_email", 
+                args=[
+                    data.feeder_name, 
+                    data.status, 
+                    data.timestamp, 
+                    server_time, 
+                    data.sim_serial,
+                    data.transformer_name,
+                    data.peak_a0,
+                    data.msisdn,
+                    data.sim_serial
+                ]
+            )
+            logger.info("Grid status metric tracking update successfully offloaded to queue.")
+        except Exception as celery_err:
+            logger.error(f"Could not send main task to Celery: {celery_err}")   
+        
+        return {
+            "status": "success",
+            "queued_at": server_time,
+            "node_validated": True
+        }
+
+    except Exception as e:
+        logger.error(f"Critical breakdown within gateway route context: {e}")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"status": "error", "message": "Internal processing pipeline error"}
+        )
+        
+        
+        
 @app.get("/api/test-email/")
 async def test_email(
     feeder_name: str = "Ayangbunren",
@@ -325,68 +392,15 @@ async def test_daily_power_updates():
     }
 
 
-@app.post("/power-tracker-gateway/")
-async def power_update1(data: PowerStatus, request: Request):
-    try:
-        # Gracefully handle validation defaults if keys are absent or marked as UNKNOWN
-        if not data.sim_serial or data.sim_serial == "UNKNOWN":
-            if data.contact_phone:
-                data.sim_serial = data.contact_phone
-            elif data.msisdn and data.msisdn != "UNKNOWN":
-                data.sim_serial = data.msisdn
-            else:
-                data.sim_serial = "UNKNOWN"
-        lagos_tz = timezone(timedelta(hours=1))
-        server_time_dt = datetime.now(lagos_tz)
-        server_time = server_time_dt.strftime("%Y-%m-%d %H:%M:%S") + f".{int(server_time_dt.microsecond / 1000):03d}"
-        
-        logger.info(
-            f"Incoming alert from Feeder: {data.feeder_name} [{data.transformer_name}] "
-            f"-> Status: {data.status.upper()} (SIM ID: {data.msisdn})"
-        )
+from fastapi.responses import PlainTextResponse, Response
 
-        # --- Security Cross-Check ---
-        try:
-            # Match IMSI/MSISDN logic safely if identity strings are available
-            if data.msisdn != "UNKNOWN" and data.sim_serial != "UNKNOWN":
-                # NOTE: If you are checking if MSISDN equals IMSI, they will mismatch. 
-                # Consider validating against a database record inside save_power_status_update instead.
-                if data.msisdn.strip() == data.sim_serial.strip():
-                    logger.info("Hardware telemetry transmission identity signature verified.")
-        except Exception as celery_sec_err:
-            logger.error(f"Failed to process security monitoring context logic: {celery_sec_err}")
+@app.get("/robots.txt")
+async def robots():
+    return PlainTextResponse("User-agent: *\nDisallow:")
 
-        # --- Celery Worker Offload ---
-        try:
-            celery_app.send_task(
-                "myapp.tasks.send_power_email", 
-                args=[
-                    data.feeder_name, 
-                    data.status, 
-                    data.timestamp, 
-                    server_time, 
-                    data.sim_serial,
-                    data.transformer_name,
-                    data.peak_a0,
-                    data.msisdn,
-                    data.sim_serial
-                ]
-            )
-            logger.info("Grid status metric tracking update successfully offloaded to queue.")
-        except Exception as celery_err:
-            logger.error(f"Could not send main task to Celery: {celery_err}")   
-        
-        return {
-            "status": "success",
-            "queued_at": server_time,
-            "node_validated": True
-        }
+@app.get("/favicon.ico")
+async def favicon():
+    return Response(status_code=204)
 
-    except Exception as e:
-        logger.error(f"Critical breakdown within gateway route context: {e}")
-        return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={"status": "error", "message": "Internal processing pipeline error"}
-        )
-        
-        
+
+
