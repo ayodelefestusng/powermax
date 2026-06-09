@@ -63,21 +63,21 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     cleaned_errors = _clean_validation_error(exc.errors())
     return JSONResponse(status_code=422, content={"detail": cleaned_errors})
 
-class PowerStatus(BaseModel):
-    status: str
-    timestamp: int
-    peak_a0: int
-    feeder_name: str
-    # Use Field aliases to match incoming variations or guarantee a fallback default
-    transformer_name: str = Field(default="UNKNOWN_TRANSFORMER", alias="transformer")
-    sim_serial: Optional[str] = "UNKNOWN"
-    contact_phone: Optional[str] = None
-    msisdn: str = "UNKNOWN"
+    class PowerStatus(BaseModel):
+        status: str
+        timestamp: int
+        peak_a0: int
+        feeder_name: str
+        # Use Field aliases to match incoming variations or guarantee a fallback default
+        transformer_name: str = Field(default="UNKNOWN_TRANSFORMER", alias="transformer")
+        sim_serial: Optional[str] = "UNKNOWN"
+        contact_phone: Optional[str] = None
+        msisdn: str = "UNKNOWN"
 
-    class Config:
-        populate_by_name = True  # Allows parsing both alias and field name keys
-    
-    
+        class Config:
+            populate_by_name = True  # Allows parsing both alias and field name keys
+        
+        
 def save_power_status_update(data: PowerStatus, server_time_dt):
     if not data.sim_serial:
         if data.contact_phone:
@@ -200,19 +200,37 @@ async def power_update1(data: PowerStatus, request: Request):
         except Exception as celery_err:
             logger.error(f"Could not send main task to Celery: {celery_err}")   
         
-        return {
-            "status": "success",
-            "queued_at": server_time,
-            "node_validated": True
-        }
+    #     return {
+    #         "status": "success",
+    #         "queued_at": server_time,
+    #         "node_validated": True
+    #     }
+
+    # except Exception as e:
+    #     logger.error(f"Critical breakdown within gateway route context: {e}")
+    #     return JSONResponse(
+    #         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+    #         content={"status": "error", "message": "Internal processing pipeline error"}
+    #     )
+        # --- Hardened SIM900 Response Termination ---
+        # Explicitly passing 'Connection: close' tells the modem the session is finished
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            headers={"Connection": "close"},
+            content={
+                "status": "success",
+                "queued_at": server_time,
+                "node_validated": True
+            }
+        )
 
     except Exception as e:
         logger.error(f"Critical breakdown within gateway route context: {e}")
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            headers={"Connection": "close"},
             content={"status": "error", "message": "Internal processing pipeline error"}
         )
-        
         
         
 @app.get("/api/test-email/")
