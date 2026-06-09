@@ -9,6 +9,12 @@ from sqlalchemy import text
 from worker.celery_app import celery_app
 from worker.db import engine
 from worker.tasks import send_whatsapp_power_message, generate_power_report, FeederObj
+from fastapi import FastAPI, Request, status, HTTPException
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+from datetime import datetime, timezone, timedelta
+from typing import Optional
+import json
 
 # Logger configuration
 # logging.basicConfig(level=logging.INFO)
@@ -150,7 +156,71 @@ def save_power_status_update(data: PowerStatus, server_time_dt):
 
 
 @app.post("/power-tracker-gateway/")
-async def power_update1(data: PowerStatus, request: Request):
+async def power_update1(request: Request):
+    # Force connection termination header response instantly
+    headers = {"Connection": "close", "Content-Type": "application/json"}
+    
+    try:
+        # 1. Read raw incoming body bytes directly to bypass proxy parsing halts
+        body_bytes = await request.body()
+        body_str = body_bytes.decode("utf-8").strip()
+        
+        if not body_str:
+            raise ValueError("Empty body stream received")
+
+        # 2. Force parse text map configuration safely
+        payload_data = json.loads(body_str)
+        data = PowerStatus(**payload_data)
+        
+        # Balance out missing identifier configurations if necessary
+        if not data.sim_serial or data.sim_serial == "UNKNOWN":
+            data.sim_serial = data.msisdn if data.msisdn != "UNKNOWN" else "UNKNOWN"
+
+        lagos_tz = timezone(timedelta(hours=1))
+        server_time_dt = datetime.now(lagos_tz)
+        server_time = server_time_dt.strftime("%Y-%m-%d %H:%M:%S") + f".{int(server_time_dt.microsecond / 1000):03d}"
+        
+        logger.info(
+            f"Edge Telemetry Ingested -> Feeder: {data.feeder_name} [{data.transformer_name}] "
+            f"-> Status: {data.status.upper()} (IP Carrier Lock)"
+        )
+
+        # --- Celery Worker Offload Execution ---
+        try:
+            celery_app.send_task(
+                "myapp.tasks.send_power_email", 
+                args=[
+                    data.feeder_name, 
+                    data.status, 
+                    data.timestamp, 
+                    server_time, 
+                    data.sim_serial,
+                    data.transformer_name,
+                    data.peak_a0,
+                    data.msisdn,
+                    data.sim_serial
+                ]
+            )
+        except Exception as celery_err:
+            logger.error(f"Queue offload mismatch warning: {celery_err}")   
+        
+        # 3. Deliver explicit close handshake status frame instantly
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            headers=headers,
+            content={"status": "success", "queued_at": server_time, "node_validated": True}
+        )
+
+    except Exception as e:
+        logger.error(f"Cellular packet decoding adjustment required: {e}")
+        return JSONResponse(
+            status_code=status.HTTP_200_OK, # Keep 200 to keep edge node context active
+            headers=headers,
+            content={"status": "handled", "error": str(e)}
+        )
+
+@app.post("/power-tracker-gatewayv1/")
+async def power_update1v1(data: PowerStatus, request: Request):
     try:
         # Gracefully handle validation defaults if keys are absent or marked as UNKNOWN
         if not data.sim_serial or data.sim_serial == "UNKNOWN":
