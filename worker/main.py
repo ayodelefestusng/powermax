@@ -69,7 +69,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     cleaned_errors = _clean_validation_error(exc.errors())
     return JSONResponse(status_code=422, content={"detail": cleaned_errors})
 
-class PowerStatus(BaseModel):
+class PowerStatusv1(BaseModel):
         status: str
         timestamp: int
         peak_a0: int
@@ -83,7 +83,36 @@ class PowerStatus(BaseModel):
         class Config:
             populate_by_name = True  # Allows parsing both alias and field name keys
         
-        
+
+from pydantic import BaseModel, Field
+from typing import Optional
+
+class PowerStatus(BaseModel):
+    # Map 'stat' from hardware directly to 'status'
+    status: str = Field(..., alias="stat")
+    
+    # Make timestamp optional since we dropped it from the hardware payload to save bytes
+    timestamp: Optional[int] = Field(default=0) 
+    
+    # Map 'val' from hardware directly to 'peak_a0'
+    peak_a0: int = Field(..., alias="val")
+    
+    # Map 'fdr' from hardware directly to 'feeder_name'
+    feeder_name: str = Field(..., alias="fdr")
+    
+    # Map 'tf' from hardware directly to 'transformer_name'
+    transformer_name: str = Field(default="UNKNOWN_TRANSFORMER", alias="tf")
+    
+    # Map 'ccid' from hardware directly to 'sim_serial'
+    sim_serial: Optional[str] = Field(default="UNKNOWN", alias="ccid")
+    
+    # Keep support for fallback keys
+    contact_phone: Optional[str] = None
+    msisdn: str = "UNKNOWN"
+
+    class Config:
+        # Crucial: Allows parsing via both the raw field names AND their aliases
+        populate_by_name = True       
 def save_power_status_update(data: PowerStatus, server_time_dt):
     if not data.sim_serial:
         if data.contact_phone:
