@@ -63,7 +63,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     cleaned_errors = _clean_validation_error(exc.errors())
     return JSONResponse(status_code=422, content={"detail": cleaned_errors})
 
-    class PowerStatus(BaseModel):
+class PowerStatus(BaseModel):
         status: str
         timestamp: int
         peak_a0: int
