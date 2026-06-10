@@ -71,10 +71,6 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     return JSONResponse(status_code=422, content={"detail": cleaned_errors})
 
 
-    
-
-
-
 class PowerStatus(BaseModel):
     status: str = Field(..., alias="stat")
     timestamp: Optional[int] = Field(default=0) 
@@ -86,8 +82,6 @@ class PowerStatus(BaseModel):
     msisdn: str = "UNKNOWN"
 
     model_config = ConfigDict(populate_by_name=True)          
-
-
 
 
 
@@ -242,7 +236,7 @@ def save_power_status_update(data: PowerStatus, server_time_dt):
 
 
 
-@app.get("/api/test-email2/")
+@app.get("/api/test-email245/")
 async def test_email(
     feeder_name: str = "Ayangbunren",
     contact_phone: str = "2348021299221"
