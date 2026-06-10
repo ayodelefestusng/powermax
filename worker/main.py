@@ -425,3 +425,9 @@ async def favicon():
 
 
 
+#Utility Endpoints   
+
+@app.get("/utility/")
+def read_root():
+    return {"message": "Hello from SIM 900"}
+
