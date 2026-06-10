@@ -541,8 +541,8 @@ def send_test_email1():
         to_emails=["buyriteautosng@gmail.com"]
     )
 
-@celery_app.task(name="myapp.tasks.send_power_email")
-def send_power_email(feeder_name, status, device_time, server_time, contact_phone=None, transformer_name="UNKNOWN_TRANSFORMER", peak_a0=0, msisdn="UNKNOWN", sim_serial="UNKNOWN"):
+@celery_app.task(name="myapp.tasks.send_power_email", bind=True, default_retry_delay=15, max_retries=10, autoretry_for=(Exception,))
+def send_power_email(self, feeder_name, status, device_time, server_time, contact_phone=None, transformer_name="UNKNOWN_TRANSFORMER", peak_a0=0, msisdn="UNKNOWN", sim_serial="UNKNOWN"):
     logger.info(f"Processing real-time power update for Feeder {feeder_name} with status {status}")
     
     # 1. Database Persistence
@@ -632,9 +632,11 @@ def send_power_email(feeder_name, status, device_time, server_time, contact_phon
             send_whatsapp_power_message(phone_to_use, body)
         else:
             logger.warning(f"No contact phone available to send WhatsApp message for Feeder {feeder_name}")
-    except Exception as e:
-        logger.error(f"Failed to send WhatsApp power alert (Evolution API dispatch failed): {e}", exc_info=True)
-
+    # except Exception as e:
+    #     logger.error(f"Failed to send WhatsApp power alert (Evolution API dispatch failed): {e}", exc_info=True)
+    except Exception as exc:
+        logger.error(f"Task failed, will retry: {exc}", exc_info=True)
+        raise self.retry(exc=exc)
 @celery_app.task(name="myapp.tasks.send_daily_power_updates")
 def send_daily_power_updates():
     logger.info("Executing periodic daily power summary updates task")
