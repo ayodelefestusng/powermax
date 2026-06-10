@@ -88,80 +88,88 @@ class PowerStatus(BaseModel):
     model_config = ConfigDict(populate_by_name=True)          
 
 
+
+
+
 @app.post("/power-tracker-gateway/")
 async def power_update1(request: Request):
+    # Force immediate connection termination headers for the SIM900
     headers = {"Connection": "close", "Content-Type": "application/json"}
     
     try:
-        # 1. Read raw incoming body bytes directly to bypass proxy parsing halts
+        # 1. Read raw incoming body bytes directly to bypass any framework hang
         body_bytes = await request.body()
         body_str = body_bytes.decode("utf-8").strip()
         
         if not body_str:
             raise ValueError("Empty body stream received")
 
-        # 2. Parse text layout safely
-        payload_data = json.loads(body_str)
+        # 2. Parse raw json dictionary directly (Bypasses Pydantic completely)
+        payload = json.loads(body_str)
         
-        # --- HARDENED FIX: Use model_validate instead of unpacking kwargs ---
-        # model_validate reads payload_data as a dictionary and natively honors ConfigDict alias configurations
-        data = PowerStatus.model_validate(payload_data)
-        
-        # Balance out missing identifier configurations if necessary
-        if not data.sim_serial or data.sim_serial == "UNKNOWN":
-            data.sim_serial = data.msisdn if data.msisdn != "UNKNOWN" else "UNKNOWN"
+        # 3. Extract values using inline alias fallbacks
+        status_val = payload.get("stat") or payload.get("status")
+        peak_val   = payload.get("val")  or payload.get("peak_a0")
+        feeder     = payload.get("fdr")  or payload.get("feeder_name")
+        xfrmr      = payload.get("tf")   or payload.get("transformer_name", "UNKNOWN_TRANSFORMER")
+        serial     = payload.get("ccid") or payload.get("sim_serial", "UNKNOWN")
+        msisdn     = payload.get("msisdn", "UNKNOWN")
+        timestamp  = payload.get("timestamp", 0)
 
+        # Log the raw payload for deep visibility
+        logger.info(f"PowerMonitor: Raw body received successfully: {body_str}")
+
+        if not status_val or peak_val is None or not feeder:
+            logger.error(f"Ingest rejected - Missing critical keys. Payload: {payload}")
+            return JSONResponse(
+                status_code=status.HTTP_200_OK, 
+                headers=headers,
+                content={"status": "rejected", "message": "Missing core tracking parameters"}
+            )
+
+        # 4. Handle timing metrics
         lagos_tz = timezone(timedelta(hours=1))
         server_time_dt = datetime.now(lagos_tz)
         server_time = server_time_dt.strftime("%Y-%m-%d %H:%M:%S") + f".{int(server_time_dt.microsecond / 1000):03d}"
         
         logger.info(
-            f"Edge Telemetry Ingested -> Feeder: {data.feeder_name} [{data.transformer_name}] "
-            f"-> Status: {data.status.upper()} (IP Carrier Lock)"
+            f"Edge Telemetry Successfully Decoded -> Feeder: {feeder} [{xfrmr}] "
+            f"-> Status: {str(status_val).upper()} | Peak A0: {peak_val}"
         )
 
-        # --- Celery Worker Offload Execution ---
+        # --- Direct Celery Worker Offload Pipeline ---
         try:
             celery_app.send_task(
                 "myapp.tasks.send_power_email", 
                 args=[
-                    data.feeder_name, 
-                    data.status, 
-                    data.timestamp, 
+                    feeder, 
+                    status_val, 
+                    timestamp, 
                     server_time, 
-                    data.sim_serial,
-                    data.transformer_name,
-                    data.peak_a0,
-                    data.msisdn,
-                    data.sim_serial
+                    serial,
+                    xfrmr,
+                    int(peak_val),
+                    msisdn,
+                    serial
                 ]
             )
+            logger.info("Grid status metric tracking update successfully offloaded to queue.")
         except Exception as celery_err:
-            logger.error(f"Queue offload mismatch warning: {celery_err}")   
+            logger.error(f"Could not send main task to Celery: {celery_err}")   
         
-        # 3. Deliver explicit close handshake status frame instantly
         return JSONResponse(
             status_code=status.HTTP_200_OK,
             headers=headers,
             content={"status": "success", "queued_at": server_time, "node_validated": True}
         )
 
-    except ValidationError as val_err:
-        logger.error(f"PowerMonitor: Validation error details: {val_err.errors()}")
-        return JSONResponse(
-            status_code=status.HTTP_200_OK,  # Force 200 so the SIM900 breaks execution stream gracefully
-            headers=headers,
-            content={"status": "handled_validation_error", "message": "Schema mapping conflict"}
-        )
     except Exception as e:
-        logger.error(f"Cellular packet decoding adjustment required: {e}")
+        logger.error(f"Critical breakdown within gateway route context: {e}")
         return JSONResponse(
             status_code=status.HTTP_200_OK, 
             headers=headers,
-            content={"status": "handled_generic_error", "error": str(e)}
+            content={"status": "error", "message": str(e)}
         )
-
-
 def save_power_status_update(data: PowerStatus, server_time_dt):
     if not data.sim_serial:
         if data.contact_phone:
