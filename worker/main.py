@@ -92,7 +92,7 @@ class PowerStatus(BaseModel):
 
 
 @app.post("/power-tracker-gateway/")
-async def power_update1(request: Request):
+async def power_update(request: Request):
     # Force immediate connection termination headers for the SIM900
     headers = {"Connection": "close", "Content-Type": "application/json"}
     
@@ -242,7 +242,7 @@ def save_power_status_update(data: PowerStatus, server_time_dt):
 
 
 
-@app.get("/api/test-email/")
+@app.get("/api/test-email2/")
 async def test_email(
     feeder_name: str = "Ayangbunren",
     contact_phone: str = "2348021299221"
