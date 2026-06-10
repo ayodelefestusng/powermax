@@ -11,7 +11,7 @@ from worker.db import engine
 from worker.tasks import send_whatsapp_power_message, generate_power_report, FeederObj
 from fastapi import FastAPI, Request, status, HTTPException
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 import json
@@ -80,12 +80,8 @@ class PowerStatusv1(BaseModel):
         contact_phone: Optional[str] = None
         msisdn: str = "UNKNOWN"
 
-        class Config:
-            populate_by_name = True  # Allows parsing both alias and field name keys
+        model_config = ConfigDict(populate_by_name=True)
         
-
-from pydantic import BaseModel, Field
-from typing import Optional
 
 class PowerStatus(BaseModel):
     # Map 'stat' from hardware directly to 'status'
@@ -110,9 +106,10 @@ class PowerStatus(BaseModel):
     contact_phone: Optional[str] = None
     msisdn: str = "UNKNOWN"
 
-    class Config:
-        # Crucial: Allows parsing via both the raw field names AND their aliases
-        populate_by_name = True       
+    model_config = ConfigDict(populate_by_name=True)
+        
+        
+          
 def save_power_status_update(data: PowerStatus, server_time_dt):
     if not data.sim_serial:
         if data.contact_phone:
