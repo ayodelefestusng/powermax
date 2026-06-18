@@ -142,7 +142,8 @@ def send_whatsapp_power_message(number: str, text: str):
     primary_recipient = f"{clean_number}@s.whatsapp.net" if "@" not in clean_number else clean_number
     
     recipients = [primary_recipient]
-    group_id = "120363406600149982@g.us"
+    # group_id = "120363406600149982@g.us"
+    group_id = "120363427045301423@g.us"
     if group_id not in recipients:
         recipients.append(group_id)
         
