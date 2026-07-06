@@ -138,14 +138,43 @@ def send_whatsapp_power_message(number: str, text: str):
         "Content-Type": "application/json"
     }
     
-    clean_number = number.replace("+", "").strip()
-    primary_recipient = f"{clean_number}@s.whatsapp.net" if "@" not in clean_number else clean_number
-    
-    recipients = [primary_recipient]
-    # group_id = "120363406600149982@g.us"
-    group_id = "120363427045301423@g.us"
-    if group_id not in recipients:
-        recipients.append(group_id)
+    primary_recipient_val = None
+    if number:
+        try:
+            with engine.connect() as conn:
+                row = conn.execute(
+                    text("SELECT primary_recipient FROM myapp_feeder WHERE registered_phone = :num OR msisdn = :num OR sim_serial = :num LIMIT 1"),
+                    {"num": number}
+                ).fetchone()
+                if row and row[0]:
+                    primary_recipient_val = row[0]
+        except Exception as db_err:
+            logger.error(f"Failed to lookup primary_recipient for {number}: {db_err}")
+
+    recipients = []
+    if primary_recipient_val:
+        import re
+        parts = re.split(r'[,\s;]+', primary_recipient_val)
+        for part in parts:
+            part = part.strip().replace("(", "").replace(")", "")
+            if not part:
+                continue
+            if "@" in part:
+                recipients.append(part)
+            else:
+                clean_p = part.replace("+", "").strip()
+                if clean_p:
+                    recipients.append(f"{clean_p}@s.whatsapp.net")
+
+    if not recipients:
+        clean_number = number.replace("+", "").strip() if number else ""
+        if clean_number:
+            primary_recipient = f"{clean_number}@s.whatsapp.net" if "@" not in clean_number else clean_number
+            recipients.append(primary_recipient)
+        
+        group_id = "120363427045301423@g.us"
+        if group_id not in recipients:
+            recipients.append(group_id)
         
     last_response = None
     for recipient in recipients:
@@ -162,9 +191,7 @@ def send_whatsapp_power_message(number: str, text: str):
             logger.info(f"WhatsApp power alert sent to {recipient}. Status code: {response.status_code}")
             if response.status_code in [200, 201]:
                 resp_json = response.json()
-                if recipient == primary_recipient:
-                    last_response = resp_json
-                elif last_response is None:
+                if last_response is None:
                     last_response = resp_json
         except Exception as e:
             logger.error(f"Failed to send WhatsApp power alert to {recipient}: {e}", exc_info=True)
@@ -570,7 +597,7 @@ def send_power_email(self, feeder_name, status, device_time, server_time, contac
             timestamp=int(device_time),
             peak_a0=int(peak_a0),
             feeder_name=feeder_name,
-            transformer_name=transformer_name,
+            transformer_code=transformer_name,
             sim_serial=sim_serial if sim_serial != "UNKNOWN" else (contact_phone or "UNKNOWN"),
             contact_phone=contact_phone,
             msisdn=msisdn
