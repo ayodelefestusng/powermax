@@ -109,9 +109,9 @@ async def power_update(request: Request):
         serial     = payload.get("ccid") or payload.get("sim_serial", "UNKNOWN")
         msisdn     = payload.get("msisdn", "UNKNOWN")
         timestamp  = payload.get("timestamp", 0)
-
+        lagos_tz = timezone(timedelta(hours=1))
         # Log the raw payload for deep visibility
-        logger.info(f"PowerMonitor: Raw body received successfully: {body_str}")
+        logger.info(f"Time Recieved {lagos_tz} : PowerMonitor: Raw body received successfully: {body_str}")
 
         if not status_val or peak_val is None or not feeder:
             logger.error(f"Ingest rejected - Missing critical keys. Payload: {payload}")
@@ -122,7 +122,7 @@ async def power_update(request: Request):
             )
 
         # 4. Handle timing metrics
-        lagos_tz = timezone(timedelta(hours=1))
+        
         server_time_dt = datetime.now(lagos_tz)
         server_time = server_time_dt.strftime("%Y-%m-%d %H:%M:%S") + f".{int(server_time_dt.microsecond / 1000):03d}"
         
