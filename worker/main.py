@@ -109,6 +109,7 @@ async def power_update(request: Request):
         serial     = payload.get("ccid") or payload.get("sim_serial", "UNKNOWN")
         msisdn     = payload.get("msisdn", "UNKNOWN")
         timestamp  = payload.get("timestamp", 0)
+        contact_phone = payload.get("contact_phone")
         lagos_tz = timezone(timedelta(hours=1))
         # Log the raw payload for deep visibility
         logger.info(f"Time Recieved {lagos_tz} : PowerMonitor: Raw body received successfullyss: {body_str}")
@@ -140,7 +141,7 @@ async def power_update(request: Request):
                     status_val, 
                     timestamp, 
                     server_time, 
-                    serial,
+                    contact_phone,
                     xfrmr,
                     int(peak_val),
                     msisdn,
