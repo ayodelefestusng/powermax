@@ -1,7 +1,7 @@
 from datetime import datetime, timezone, timedelta
 import logging
 from pathlib import Path
-from fastapi import FastAPI, HTTPException, Request, status
+from fastapi import FastAPI, HTTPException, Request, status, BackgroundTasks
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import text
@@ -437,6 +437,127 @@ async def robots():
 async def favicon():
     return Response(status_code=204)
 
+
+import os
+import requests
+
+def send_attendance_whatsapp(api_url: str, api_key: str, instance: str, phone: str, message: str):
+    url = f"{api_url.rstrip('/')}/message/sendText/{instance}"
+    headers = {
+        "apikey": api_key,
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "number": phone,
+        "text": message
+    }
+    try:
+        response = requests.post(url, json=payload, headers=headers, timeout=10)
+        if response.status_code in [200, 201]:
+            logger.info(f"Attendance WhatsApp notification sent to {phone} successfully.")
+        else:
+            logger.error(f"Evolution API Error ({response.status_code}): {response.text}")
+    except Exception as e:
+        logger.error(f"Failed to send attendance WhatsApp notification: {e}", exc_info=True)
+
+
+class AttendanceRequest(BaseModel):
+    tenant_code: str
+    student_id: str
+    status: str
+
+
+@app.post("/attendance/")
+async def create_attendance(data: AttendanceRequest):
+    status_lower = data.status.lower()
+    if status_lower not in ['in', 'out']:
+        raise HTTPException(status_code=400, detail="status must be 'in' or 'out'")
+    
+    try:
+        with engine.begin() as conn:
+            # 1. Look up school tenant by tenant_code
+            tenant_query = text("SELECT id, tenant_name, evolution_instance, evolution_api FROM myapp_school_tenant WHERE tenant_code = :tenant_code")
+            tenant_row = conn.execute(tenant_query, {"tenant_code": data.tenant_code}).fetchone()
+            
+            if not tenant_row:
+                raise HTTPException(status_code=404, detail=f"School tenant with code '{data.tenant_code}' not found")
+                
+            tenant_db_id = tenant_row[0]
+            evolution_instance = tenant_row[2]
+            tenant_evolution_api = tenant_row[3]
+            
+            # 2. Look up student by student_id and tenant_name_id (the school tenant primary key)
+            student_query = text("""
+                SELECT id, student_firstname, student_lastname, guardian_phone 
+                FROM myapp_student_profile 
+                WHERE student_id = :student_id AND tenant_name_id = :tenant_db_id
+            """)
+            student_row = conn.execute(student_query, {
+                "student_id": data.student_id,
+                "tenant_db_id": tenant_db_id
+            }).fetchone()
+            
+            if not student_row:
+                raise HTTPException(status_code=404, detail=f"Student with id '{data.student_id}' not found under tenant '{data.tenant_code}'")
+                
+            student_db_id = student_row[0]
+            student_firstname = student_row[1]
+            student_lastname = student_row[2]
+            guardian_phone = student_row[3]
+            student_name = f"{student_firstname} {student_lastname}"
+            
+            # 3. Insert log into myapp_attendance_log
+            lagos_tz = timezone(timedelta(hours=1))
+            now_local = datetime.now(lagos_tz)
+            
+            insert_query = text("""
+                INSERT INTO myapp_attendance_log (student_id, status, created)
+                VALUES (:student_id, :status, :created)
+                RETURNING id
+            """)
+            log_id = conn.execute(insert_query, {
+                "student_id": student_db_id,
+                "status": status_lower,
+                "created": now_local
+            }).scalar()
+            
+            logger.info(f"Recorded attendance for student {data.student_id} under tenant {data.tenant_code}: {status_lower} at {now_local}")
+            
+            # 4. Asynchronously send WhatsApp message to the guardian_phone if available
+            if guardian_phone and evolution_instance:
+                if status_lower == 'in':
+                    message = f"{student_name} has arrived school"
+                else:
+                    time_str = now_local.strftime('%I:%M%p').lower().lstrip('0')
+                    message = f"{student_name} has left school at {time_str}"
+                
+                # Resolve API URL and Key
+                api_url = os.getenv("EVOLUTION_API_URL", "https://vectra-evolution-api.qgmg5v.easypanel.host")
+                api_key = os.getenv("EVOLUTION_API_KEY", "4296843w3C4wwC977eeerr415CAwwed")
+                
+                if tenant_evolution_api:
+                    val = tenant_evolution_api.strip()
+                    if val.startswith("http://") or val.startswith("https://"):
+                        api_url = val
+                    else:
+                        api_key = val
+                
+                try:
+                    celery_app.send_task(
+                        "myapp.tasks.send_attendance_whatsapp",
+                        args=[api_url, api_key, evolution_instance, guardian_phone, message]
+                    )
+                    logger.info(f"Enqueued Celery task send_attendance_whatsapp for guardian of {student_name} (Phone: {guardian_phone})")
+                except Exception as celery_err:
+                    logger.error(f"Could not send attendance WhatsApp task to Celery: {celery_err}")
+                
+            return {"status": "success", "log_id": log_id, "student_id": data.student_id, "tenant_code": data.tenant_code}
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error saving attendance: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 #Utility Endpoints   

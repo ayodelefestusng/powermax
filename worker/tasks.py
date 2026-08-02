@@ -764,3 +764,24 @@ def send_security_alert_email(feeder_name, transformer_name, contact_phone, msis
         send_whatsapp_power_message(phone_to_use, body)
     else:
         logger.warning("No contact phone available to send security alert WhatsApp.")
+
+
+@celery_app.task(name="myapp.tasks.send_attendance_whatsapp")
+def send_attendance_whatsapp(api_url: str, api_key: str, instance: str, phone: str, message: str):
+    url = f"{api_url.rstrip('/')}/message/sendText/{instance}"
+    headers = {
+        "apikey": api_key,
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "number": phone,
+        "text": message
+    }
+    try:
+        response = requests.post(url, json=payload, headers=headers, timeout=10)
+        if response.status_code in [200, 201]:
+            logger.info(f"Attendance WhatsApp notification sent to {phone} successfully via Celery.")
+        else:
+            logger.error(f"Evolution API Error ({response.status_code}): {response.text}")
+    except Exception as e:
+        logger.error(f"Failed to send attendance WhatsApp notification: {e}", exc_info=True)
