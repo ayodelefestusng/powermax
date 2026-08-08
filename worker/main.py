@@ -87,7 +87,7 @@ class PowerStatus(BaseModel):
 
 @app.post("/power-tracker-gateway/")
 async def power_update(request: Request):
-    # Force immediate connection termination headers for the SIM900
+    # Force immediate connection termination headers for the SIM900/ESP32
     headers = {"Connection": "close", "Content-Type": "application/json"}
     
     try:
@@ -110,9 +110,19 @@ async def power_update(request: Request):
         msisdn     = payload.get("msisdn", "UNKNOWN")
         timestamp  = payload.get("timestamp", 0)
         contact_phone = payload.get("contact_phone")
+        dt_code    = payload.get("dt", "")  # Device type identifier e.g. "PEARL"
+
+        # 3a. Three-phase fields (populated by PEARL DT and future 3-phase nodes)
+        stat_r = payload.get("stat_r", None)   # "ON" / "OFF"
+        volt_r = payload.get("volt_r", 0.0)
+        stat_y = payload.get("stat_y", None)
+        volt_y = payload.get("volt_y", 0.0)
+        stat_b = payload.get("stat_b", None)
+        volt_b = payload.get("volt_b", 0.0)
+
         lagos_tz = timezone(timedelta(hours=1))
         # Log the raw payload for deep visibility
-        logger.info(f"Time Recieved {lagos_tz} : PowerMonitor: Raw body received successfullyss: {body_str}")
+        logger.info(f"Time Received {lagos_tz} : PowerMonitor: Raw body received: {body_str}")
 
         if not status_val or peak_val is None or not feeder:
             logger.error(f"Ingest rejected - Missing critical keys. Payload: {payload}")
@@ -123,14 +133,21 @@ async def power_update(request: Request):
             )
 
         # 4. Handle timing metrics
-        
         server_time_dt = datetime.now(lagos_tz)
         server_time = server_time_dt.strftime("%Y-%m-%d %H:%M:%S") + f".{int(server_time_dt.microsecond / 1000):03d}"
         
-        logger.info(
-            f"on {lagos_tz} Edge Telemetry Successfully Decoded -> Feeder: {feeder} [{xfrmr}] "
-            f"-> Status: {str(status_val).upper()} | Peak A0: {peak_val}"
-        )
+        is_pearl = (dt_code.upper() == "PEARL")
+        if is_pearl:
+            logger.info(
+                f"[PEARL DT] Three-phase telemetry → Feeder: {feeder} [{xfrmr}] "
+                f"R:{stat_r}/{volt_r}V  Y:{stat_y}/{volt_y}V  B:{stat_b}/{volt_b}V  "
+                f"Combined:{str(status_val).upper()}"
+            )
+        else:
+            logger.info(
+                f"Edge Telemetry Decoded → Feeder: {feeder} [{xfrmr}] "
+                f"Status: {str(status_val).upper()} | Peak A0: {peak_val}"
+            )
 
         # --- Direct Celery Worker Offload Pipeline ---
         try:
@@ -145,7 +162,14 @@ async def power_update(request: Request):
                     xfrmr,
                     int(peak_val),
                     msisdn,
-                    serial
+                    serial,
+                    dt_code,
+                    stat_r,
+                    float(volt_r),
+                    stat_y,
+                    float(volt_y),
+                    stat_b,
+                    float(volt_b),
                 ]
             )
             logger.info("Grid status metric tracking update successfully offloaded to queue.")
@@ -165,7 +189,11 @@ async def power_update(request: Request):
             headers=headers,
             content={"status": "error", "message": str(e)}
         )
-def save_power_status_update(data: PowerStatus, server_time_dt):
+def save_power_status_update(data: PowerStatus, server_time_dt,
+                             dt: str = "",
+                             stat_r=None, volt_r: float = 0.0,
+                             stat_y=None, volt_y: float = 0.0,
+                             stat_b=None, volt_b: float = 0.0):
     if not data.sim_serial:
         if data.contact_phone:
             data.sim_serial = data.contact_phone
@@ -196,10 +224,16 @@ def save_power_status_update(data: PowerStatus, server_time_dt):
                 resolved_transformer_name = data.transformer_code
 
             if not feeder:
-                # Create feeder
+                # Create feeder with default WhatsApp recipients
                 insert_feeder_query = text("""
-                    INSERT INTO myapp_feeder (name, transformer_name, transformer_code, sim_serial, msisdn, band, created_at)
-                    VALUES (:name, :transformer_name, :transformer_code, :sim_serial, :msisdn, 'A', :created_at)
+                    INSERT INTO myapp_feeder (
+                        name, transformer_name, transformer_code, sim_serial, msisdn,
+                        band, created_at, whatsapp_primary, whatsapp_group
+                    )
+                    VALUES (
+                        :name, :transformer_name, :transformer_code, :sim_serial, :msisdn,
+                        'A', :created_at, :whatsapp_primary, :whatsapp_group
+                    )
                     RETURNING id
                 """)
                 feeder_id = conn.execute(insert_feeder_query, {
@@ -208,7 +242,9 @@ def save_power_status_update(data: PowerStatus, server_time_dt):
                     "transformer_code": data.transformer_code,
                     "sim_serial": data.sim_serial,
                     "msisdn": data.msisdn,
-                    "created_at": now_local
+                    "created_at": now_local,
+                    "whatsapp_primary": "2348021299221",
+                    "whatsapp_group": "120363410539285836@g.us",
                 }).scalar()
             else:
                 feeder_id = feeder[0]
@@ -216,7 +252,8 @@ def save_power_status_update(data: PowerStatus, server_time_dt):
                 if feeder[1] != resolved_transformer_name or feeder[2] != data.sim_serial or feeder[3] != data.msisdn or feeder[4] != data.transformer_code:
                     update_feeder_query = text("""
                         UPDATE myapp_feeder
-                        SET transformer_name = :transformer_name, transformer_code = :transformer_code, sim_serial = :sim_serial, msisdn = :msisdn
+                        SET transformer_name = :transformer_name, transformer_code = :transformer_code,
+                            sim_serial = :sim_serial, msisdn = :msisdn
                         WHERE id = :id
                     """)
                     conn.execute(update_feeder_query, {
@@ -227,11 +264,18 @@ def save_power_status_update(data: PowerStatus, server_time_dt):
                         "id": feeder_id
                     })
             
-            # Save power status
-            # PowerStatus now stores `sim_serial` instead of `contact_phone`
+            # Save power status — includes three-phase columns for PEARL DT
             insert_status_query = text("""
-                INSERT INTO myapp_powerstatus (feeder_id, status, timestamp, peak_a0, server_time, sim_serial, msisdn)
-                VALUES (:feeder_id, :status, :timestamp, :peak_a0, :server_time, :sim_serial, :msisdn)
+                INSERT INTO myapp_powerstatus (
+                    feeder_id, status, timestamp, peak_a0, server_time,
+                    sim_serial, msisdn,
+                    dt, volt_r, stat_r, volt_y, stat_y, volt_b, stat_b
+                )
+                VALUES (
+                    :feeder_id, :status, :timestamp, :peak_a0, :server_time,
+                    :sim_serial, :msisdn,
+                    :dt, :volt_r, :stat_r, :volt_y, :stat_y, :volt_b, :stat_b
+                )
             """)
             conn.execute(insert_status_query, {
                 "feeder_id": feeder_id,
@@ -239,10 +283,17 @@ def save_power_status_update(data: PowerStatus, server_time_dt):
                 "timestamp": data.timestamp,
                 "peak_a0": data.peak_a0,
                 "server_time": server_time_dt,
-                "sim_serial": data.sim_serial,  # using sim_serial as the SIM identifier
+                "sim_serial": data.sim_serial,
                 "msisdn": data.msisdn,
+                "dt": dt or "",
+                "volt_r": volt_r,
+                "stat_r": stat_r,
+                "volt_y": volt_y,
+                "stat_y": stat_y,
+                "volt_b": volt_b,
+                "stat_b": stat_b,
             })
-            logger.info(f"Persisted power status update in database for feeder {data.feeder_name}")
+            logger.info(f"Persisted power status update in database for feeder {data.feeder_name} [dt={dt}]")
             return feeder_id
     except Exception as e:
         logger.error(f"Error persisting power status update for feeder {data.feeder_name}: {e}", exc_info=True)

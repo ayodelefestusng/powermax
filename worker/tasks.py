@@ -129,7 +129,9 @@ def format_duration(td):
 
 def send_whatsapp_power_message(number: str, text: str):
     """
-    Send a text message via Evolution API to the specified contact and the power monitoring group.
+    Send a text message via Evolution API.
+    Recipients are resolved from Feeder.whatsapp_primary + Feeder.whatsapp_group,
+    falling back to Feeder.primary_recipient (legacy), then to the supplied number.
     """
     base_url = EVOLUTION_API_URL.rstrip('/')
     url = f"{base_url}/message/sendText/{POWER_INSTANCE}"
@@ -138,43 +140,61 @@ def send_whatsapp_power_message(number: str, text: str):
         "Content-Type": "application/json"
     }
     
-    primary_recipient_val = None
+    recipients = []
     if number:
         try:
             with engine.connect() as conn:
                 row = conn.execute(
-                    text("SELECT primary_recipient FROM myapp_feeder WHERE registered_phone = :num OR msisdn = :num OR sim_serial = :num LIMIT 1"),
+                    text("""SELECT whatsapp_primary, whatsapp_group, primary_recipient
+                             FROM myapp_feeder
+                             WHERE registered_phone = :num OR msisdn = :num OR sim_serial = :num
+                             LIMIT 1"""),
                     {"num": number}
                 ).fetchone()
-                if row and row[0]:
-                    primary_recipient_val = row[0]
+                if row:
+                    wp_primary, wp_group, legacy_recipients = row
+                    if wp_primary:
+                        num_clean = wp_primary.replace("+", "").strip()
+                        if num_clean:
+                            recipients.append(
+                                f"{num_clean}@s.whatsapp.net" if "@" not in num_clean else num_clean
+                            )
+                    if wp_group:
+                        g = wp_group.strip()
+                        if g and g not in recipients:
+                            recipients.append(g)
+                    # Legacy fallback from primary_recipient
+                    if not recipients and legacy_recipients:
+                        import re
+                        parts = re.split(r'[,\s;]+', legacy_recipients)
+                        for part in parts:
+                            part = part.strip().replace("(", "").replace(")", "")
+                            if not part:
+                                continue
+                            if "@" in part:
+                                recipients.append(part)
+                            else:
+                                clean_p = part.replace("+", "").strip()
+                                if clean_p:
+                                    recipients.append(f"{clean_p}@s.whatsapp.net")
         except Exception as db_err:
-            logger.error(f"Failed to lookup primary_recipient for {number}: {db_err}")
+            logger.error(f"Failed to lookup WhatsApp recipients for {number}: {db_err}")
 
-    recipients = []
-    if primary_recipient_val:
-        import re
-        parts = re.split(r'[,\s;]+', primary_recipient_val)
-        for part in parts:
-            part = part.strip().replace("(", "").replace(")", "")
-            if not part:
-                continue
-            if "@" in part:
-                recipients.append(part)
-            else:
-                clean_p = part.replace("+", "").strip()
-                if clean_p:
-                    recipients.append(f"{clean_p}@s.whatsapp.net")
-
+    # Hard fallback: use the supplied number + default group
     if not recipients:
         clean_number = number.replace("+", "").strip() if number else ""
         if clean_number:
-            primary_recipient = f"{clean_number}@s.whatsapp.net" if "@" not in clean_number else clean_number
-            recipients.append(primary_recipient)
-        
-        group_id = "120363427045301423@g.us"
-        if group_id not in recipients:
-            recipients.append(group_id)
+            recipients.append(
+                f"{clean_number}@s.whatsapp.net" if "@" not in clean_number else clean_number
+            )
+        default_group = "120363410539285836@g.us"
+        if default_group not in recipients:
+            recipients.append(default_group)
+
+    # Always ensure 2348021299221 is included
+    mandatory = "2348021299221@s.whatsapp.net"
+    if mandatory not in recipients:
+        recipients.append(mandatory)
         
     last_response = None
     for recipient in recipients:
@@ -570,9 +590,30 @@ def send_test_email1():
     )
 
 @celery_app.task(name="myapp.tasks.send_power_email", bind=True, default_retry_delay=15, max_retries=10, autoretry_for=(Exception,))
-def send_power_email(self, feeder_name, status, device_time, server_time, contact_phone=None, transformer_name="UNKNOWN_TRANSFORMER", peak_a0=0, msisdn="UNKNOWN", sim_serial="UNKNOWN"):
-    logger.info(f"Processing real-time power update for Feeder {feeder_name} with status {status}")
+def send_power_email(
+    self,
+    feeder_name,
+    status,
+    device_time,
+    server_time,
+    contact_phone=None,
+    transformer_name="UNKNOWN_TRANSFORMER",
+    peak_a0=0,
+    msisdn="UNKNOWN",
+    sim_serial="UNKNOWN",
+    # Three-phase / PEARL DT extensions
+    dt: str = "",
+    stat_r=None,
+    volt_r: float = 0.0,
+    stat_y=None,
+    volt_y: float = 0.0,
+    stat_b=None,
+    volt_b: float = 0.0,
+):
+    logger.info(f"Processing real-time power update for Feeder {feeder_name} | status={status} | dt={dt or 'std'}")
     
+    is_pearl = (str(dt).upper() == "PEARL")
+
     # 1. Database Persistence
     feeder = None
     try:
@@ -603,8 +644,14 @@ def send_power_email(self, feeder_name, status, device_time, server_time, contac
             msisdn=msisdn
         )
         
-        # Save power status and get feeder_id
-        feeder_id = save_power_status_update(data, server_time_dt)
+        # Save power status with phase data
+        feeder_id = save_power_status_update(
+            data, server_time_dt,
+            dt=dt,
+            stat_r=stat_r, volt_r=volt_r,
+            stat_y=stat_y, volt_y=volt_y,
+            stat_b=stat_b, volt_b=volt_b,
+        )
         
         # Retrieve the updated Feeder details for reporting
         with engine.connect() as conn:
@@ -617,10 +664,9 @@ def send_power_email(self, feeder_name, status, device_time, server_time, contac
                 
     except Exception as db_err:
         logger.error(f"Database persistence failed, task will be retried: {db_err}", exc_info=True)
-        # Allow Celery to retry by propagating the exception
         raise db_err
 
-    # 2. Reconstruct today's log cycles report
+    # 2. Build the report body
     if feeder is None:
         feeder = FeederObj(0, feeder_name, contact_phone)
         
@@ -632,6 +678,26 @@ def send_power_email(self, feeder_name, status, device_time, server_time, contac
         logger.error(f"Error generating power report: {e}", exc_info=True)
         body = f"{feeder_name} status is {status}\nServer time: {server_time}"
 
+    # 2a. For PEARL DT: prepend three-phase voltage table to the WhatsApp message
+    if is_pearl and stat_r is not None:
+        stat_r_str   = str(stat_r).upper()
+        stat_y_str   = str(stat_y).upper()
+        stat_b_str   = str(stat_b).upper()
+        icon_r = "🟢" if stat_r_str == "ON" else "🔴"
+        icon_y = "🟢" if stat_y_str == "ON" else "🔴"
+        icon_b = "🟢" if stat_b_str == "ON" else "🔴"
+
+        phase_block = (
+            f"⚡ *PEARL DT — Three-Phase Status Update*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{icon_r} *Red Phase*:    {volt_r:.1f}V — *{stat_r_str}*\n"
+            f"{icon_y} *Yellow Phase*: {volt_y:.1f}V — *{stat_y_str}*\n"
+            f"{icon_b} *Blue Phase*:   {volt_b:.1f}V — *{stat_b_str}*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        )
+        body = phase_block + body
+        logger.info(f"[PEARL DT] Phase block prepended to WhatsApp message.")
+
     # 3. Send Email Alert
     try:
         gmail_user = os.getenv("GMAIL_USER") or "upwardwave.dignity@gmail.com"
@@ -639,6 +705,11 @@ def send_power_email(self, feeder_name, status, device_time, server_time, contac
         to_email = os.getenv("ALERT_RECIPIENT") or "ayodelefestusng@gmail.com"
 
         subject = f"ALERT: Grid Power is {status.upper()} - {feeder_name}"
+        if is_pearl:
+            subject = (
+                f"[PEARL DT] R:{stat_r} Y:{stat_y} B:{stat_b} — "
+                f"Grid Power {status.upper()} — {feeder_name}"
+            )
 
         msg = MIMEMultipart()
         msg['From'] = gmail_user
@@ -660,8 +731,6 @@ def send_power_email(self, feeder_name, status, device_time, server_time, contac
             send_whatsapp_power_message(phone_to_use, body)
         else:
             logger.warning(f"No contact phone available to send WhatsApp message for Feeder {feeder_name}")
-    # except Exception as e:
-    #     logger.error(f"Failed to send WhatsApp power alert (Evolution API dispatch failed): {e}", exc_info=True)
     except Exception as exc:
         logger.error(f"Task failed, will retry: {exc}", exc_info=True)
         raise self.retry(exc=exc)
