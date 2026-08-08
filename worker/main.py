@@ -89,13 +89,14 @@ class PowerStatus(BaseModel):
 async def power_update(request: Request):
     # Force immediate connection termination headers for the SIM900/ESP32
     headers = {"Connection": "close", "Content-Type": "application/json"}
-    
+    lagos_tz = timezone(timedelta(hours=1))
     try:
         # 1. Read raw incoming body bytes directly to bypass any framework hang
         body_bytes = await request.body()
         body_str = body_bytes.decode("utf-8").strip()
         
         if not body_str:
+            logger.error(f"Time Received {lagos_tz} : Ingest rejected - Empty body stream received. Raw body: {body_bytes}")
             raise ValueError("Empty body stream received")
 
         # 2. Parse raw json dictionary directly (Bypasses Pydantic completely)
@@ -120,7 +121,7 @@ async def power_update(request: Request):
         stat_b = payload.get("stat_b", None)
         volt_b = payload.get("volt_b", 0.0)
 
-        lagos_tz = timezone(timedelta(hours=1))
+        
         # Log the raw payload for deep visibility
         logger.info(f"Time Received {lagos_tz} : PowerMonitor: Raw body received: {body_str}")
 
