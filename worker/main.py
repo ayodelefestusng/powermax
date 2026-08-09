@@ -618,3 +618,19 @@ async def create_attendance(data: AttendanceRequest):
 def read_root():
     return {"message": "Hello from SIM 900"}
 
+
+@app.api_route("/testing", methods=["GET", "POST"])
+async def testing_endpoint(request: Request):
+    logger.info("Testing endpoint called")
+    headers = {"Connection": "close", "Content-Type": "application/json"}
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        headers=headers,
+        content={
+            "status": "success",
+            "message": "Testing endpoint operational",
+            "timestamp": datetime.now(timezone(timedelta(hours=1))).strftime("%Y-%m-%d %H:%M:%S")
+        }
+    )
+
+
