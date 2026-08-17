@@ -244,8 +244,8 @@ def save_power_status_update(data: PowerStatus, server_time_dt,
                     "sim_serial": data.sim_serial,
                     "msisdn": data.msisdn,
                     "created_at": now_local,
-                    "whatsapp_primary": "2348021299221",
-                    "whatsapp_group": "120363410539285836@g.us",
+                    "whatsapp_primary": "2348021299221, 2348108383472",
+                    "whatsapp_group": "120363410539285836@g.us, 120363429032532411@g.us",
                 }).scalar()
             else:
                 feeder_id = feeder[0]
@@ -616,7 +616,7 @@ async def create_attendance(data: AttendanceRequest):
 
 @app.get("/utility/")
 def read_root():
-    return {"message": "Hello from SIM 900"}
+    return {"message": "Hello from SIM 900 17082026v2"}
 
 
 @app.api_route("/testing", methods=["GET", "POST"])

@@ -153,48 +153,59 @@ def send_whatsapp_power_message(number: str, text: str):
                 ).fetchone()
                 if row:
                     wp_primary, wp_group, legacy_recipients = row
+                    import re
                     if wp_primary:
-                        num_clean = wp_primary.replace("+", "").strip()
-                        if num_clean:
-                            recipients.append(
-                                f"{num_clean}@s.whatsapp.net" if "@" not in num_clean else num_clean
-                            )
+                        for p in re.split(r'[,\s;]+', str(wp_primary)):
+                            p_clean = p.replace("+", "").strip()
+                            if p_clean:
+                                formatted = f"{p_clean}@s.whatsapp.net" if "@" not in p_clean else p_clean
+                                if formatted not in recipients:
+                                    recipients.append(formatted)
                     if wp_group:
-                        g = wp_group.strip()
-                        if g and g not in recipients:
-                            recipients.append(g)
+                        for g in re.split(r'[,\s;]+', str(wp_group)):
+                            g_clean = g.strip()
+                            if g_clean and g_clean not in recipients:
+                                recipients.append(g_clean)
                     # Legacy fallback from primary_recipient
                     if not recipients and legacy_recipients:
-                        import re
                         parts = re.split(r'[,\s;]+', legacy_recipients)
                         for part in parts:
                             part = part.strip().replace("(", "").replace(")", "")
                             if not part:
                                 continue
                             if "@" in part:
-                                recipients.append(part)
+                                if part not in recipients:
+                                    recipients.append(part)
                             else:
                                 clean_p = part.replace("+", "").strip()
                                 if clean_p:
-                                    recipients.append(f"{clean_p}@s.whatsapp.net")
+                                    formatted = f"{clean_p}@s.whatsapp.net"
+                                    if formatted not in recipients:
+                                        recipients.append(formatted)
         except Exception as db_err:
             logger.error(f"Failed to lookup WhatsApp recipients for {number}: {db_err}")
 
-    # Hard fallback: use the supplied number + default group
+    # Fallback: if no recipients found in DB, use supplied number + defaults
     if not recipients:
-        clean_number = number.replace("+", "").strip() if number else ""
-        if clean_number:
-            recipients.append(
-                f"{clean_number}@s.whatsapp.net" if "@" not in clean_number else clean_number
-            )
-        default_group = "120363410539285836@g.us"
-        if default_group not in recipients:
-            recipients.append(default_group)
-
-    # Always ensure 2348021299221 is included
-    mandatory = "2348021299221@s.whatsapp.net"
-    if mandatory not in recipients:
-        recipients.append(mandatory)
+        import re
+        if number:
+            clean_number = number.replace("+", "").strip()
+            if clean_number:
+                formatted = f"{clean_number}@s.whatsapp.net" if "@" not in clean_number else clean_number
+                if formatted not in recipients:
+                    recipients.append(formatted)
+        default_primaries = "2348021299221, 2348108383472"
+        for p in re.split(r'[,\s;]+', default_primaries):
+            p_clean = p.replace("+", "").strip()
+            if p_clean:
+                formatted = f"{p_clean}@s.whatsapp.net" if "@" not in p_clean else p_clean
+                if formatted not in recipients:
+                    recipients.append(formatted)
+        default_groups = "120363410539285836@g.us, 120363429032532411@g.us"
+        for g in re.split(r'[,\s;]+', default_groups):
+            g_clean = g.strip()
+            if g_clean and g_clean not in recipients:
+                recipients.append(g_clean)
         
     last_response = None
     for recipient in recipients:
