@@ -122,9 +122,23 @@ async def power_update(request: Request):
         volt_b = payload.get("volt_b", 0.0)
 
         
-        # Log the raw payload for deep visibility
-        logger.info(f"Time Received {lagos_tz} : PowerMonitor: Raw body received: {body_str}")
+        # Convert timestamp to human-readable date/time
+        human_timestamp = str(timestamp)
+        if timestamp:
+            try:
+                ts_val = float(timestamp)
+                if ts_val > 1e11:  # epoch in milliseconds
+                    ts_val /= 1000.0
+                if ts_val > 0:
+                    human_timestamp = datetime.fromtimestamp(ts_val, tz=lagos_tz).strftime("%Y-%m-%d %H:%M:%S")
+            except (ValueError, TypeError, OverflowError):
+                human_timestamp = str(timestamp)
 
+        now_str = datetime.now(lagos_tz).strftime("%Y-%m-%d %H:%M:%S")
+
+        # Log the raw payload for deep visibility
+        logger.info(f"Time Received {now_str} : PowerMonitor: Raw body received: {body_str}")
+        logger.info(f"Time Stamp {now_str} : PowerMonitor: Timestamp: {human_timestamp} (raw: {timestamp})")
         if not status_val or peak_val is None or not feeder:
             logger.error(f"Ingest rejected - Missing critical keys. Payload: {payload}")
             return JSONResponse(
@@ -616,7 +630,7 @@ async def create_attendance(data: AttendanceRequest):
 
 @app.get("/utility/")
 def read_root():
-    return {"message": "Hello from SIM 900 17082026v2"}
+    return {"message": "Hello from SIM 900 17082026v2 timestap"}
 
 
 @app.api_route("/testing", methods=["GET", "POST"])
