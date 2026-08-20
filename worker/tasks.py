@@ -127,7 +127,7 @@ def format_duration(td):
         parts.append(f"{minutes}{m_str}")
     return " ".join(parts)
 
-def send_whatsapp_power_message(number: str, text: str):
+def send_whatsapp_power_message(number: str, message_body: str):
     """
     Send a text message via Evolution API.
     Recipients are resolved from Feeder.whatsapp_primary + Feeder.whatsapp_group,
@@ -212,7 +212,7 @@ def send_whatsapp_power_message(number: str, text: str):
         logger.info(f"Sending WhatsApp power alert to {recipient}")
         payload = {
             "number": recipient,
-            "text": text,
+            "text": message_body,
             "linkPreview": False
         }
         logger.info(f"Payload: {payload}")
