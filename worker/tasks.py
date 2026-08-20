@@ -309,7 +309,7 @@ def generate_power_report(feeder, target_date, is_today=True):
     else:
         outages.append((make_aware_lagos(start_dt), make_aware_lagos(end_dt)))
         
-    total_supply = sum((off - on for on, off in cycles), timedelta())
+    total_supply = sum((c[1] - c[0] for c in cycles), timedelta())
     
     # ------------------
     # TASK 2: Real-time update format (is_today = True)
@@ -498,7 +498,9 @@ def generate_power_report(feeder, target_date, is_today=True):
         lines.append("")
         
         lines.append("🔹 Supply Log")
-        for on_time, off_time in cycles:
+        for item in cycles:
+            on_time = item[0]
+            off_time = item[1]
             duration = off_time - on_time
             on_str = format_time_colon(on_time)
             off_str = format_time_colon(off_time)
