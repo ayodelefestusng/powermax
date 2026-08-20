@@ -182,6 +182,7 @@ def send_whatsapp_power_message(number: str, message_body: str):
                                     formatted = f"{clean_p}@s.whatsapp.net"
                                     if formatted not in recipients:
                                         recipients.append(formatted)
+            logger.info(f"WhatsApp recipients for {number}: {recipients}")
         except Exception as db_err:
             logger.error(f"Failed to lookup WhatsApp recipients for {number}: {db_err}")
 
