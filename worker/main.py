@@ -102,9 +102,9 @@ async def power_update(request: Request):
         # 2. Parse raw json dictionary directly (Bypasses Pydantic completely)
         payload = json.loads(body_str)
         
-        # 3. Extract values using inline alias fallbacks
-        status_val = payload.get("stat") or payload.get("status")
-        peak_val   = payload.get("val")  or payload.get("peak_a0")
+        # 3. Extract values using inline alias fallbacks (checking key existence / non-None to allow 0.0 or 0)
+        status_val = payload.get("stat") if payload.get("stat") is not None else payload.get("status")
+        peak_val   = payload.get("val") if payload.get("val") is not None else payload.get("peak_a0")
         feeder     = payload.get("fdr")  or payload.get("feeder_name")
         xfrmr      = payload.get("tf")   or payload.get("transformer_name", "UNKNOWN_TRANSFORMER")
         serial     = payload.get("ccid") or payload.get("sim_serial", "UNKNOWN")

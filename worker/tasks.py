@@ -147,7 +147,7 @@ def send_whatsapp_power_message(number: str, text: str):
                 row = conn.execute(
                     text("""SELECT whatsapp_primary, whatsapp_group, primary_recipient
                              FROM myapp_feeder
-                             WHERE registered_phone = :num OR msisdn = :num OR sim_serial = :num
+                             WHERE registered_phone = :num OR msisdn = :num OR sim_serial = :num OR name = :num
                              LIMIT 1"""),
                     {"num": number}
                 ).fetchone()
@@ -737,11 +737,11 @@ def send_power_email(
 
     # 4. Send WhatsApp Alert
     try:
-        phone_to_use = contact_phone or feeder.contact_phone
+        phone_to_use = contact_phone or feeder.contact_phone or feeder.name or feeder_name
         if phone_to_use:
             send_whatsapp_power_message(phone_to_use, body)
         else:
-            logger.warning(f"No contact phone available to send WhatsApp message for Feeder {feeder_name}")
+            logger.warning(f"No contact phone or feeder name available to send WhatsApp message for Feeder {feeder_name}")
     except Exception as exc:
         logger.error(f"Task failed, will retry: {exc}", exc_info=True)
         raise self.retry(exc=exc)
@@ -791,10 +791,11 @@ def send_daily_power_updates():
                 logger.error(f"Failed to send daily summary email for Feeder {feeder.name}: {e}", exc_info=True)
                 
             # Send WhatsApp
-            if feeder.contact_phone:
-                send_whatsapp_power_message(feeder.contact_phone, body)
+            phone_to_use = feeder.contact_phone or feeder.name
+            if phone_to_use:
+                send_whatsapp_power_message(phone_to_use, body)
             else:
-                logger.info(f"No contact phone available to send daily summary WhatsApp for Feeder {feeder.name}")
+                logger.info(f"No contact phone or feeder name available to send daily summary WhatsApp for Feeder {feeder.name}")
                 
         except Exception as e:
             logger.error(f"Error generating daily summary report for Feeder {feeder.name}: {e}", exc_info=True)
