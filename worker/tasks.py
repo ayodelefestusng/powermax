@@ -290,12 +290,12 @@ def generate_power_report(feeder, target_date, is_today=True):
                 current_on = server_time_aware
         elif status_upper == 'OFF':
             if current_on is not None:
-                cycles.append((current_on, server_time_aware))
+                cycles.append((current_on, server_time_aware, False))
                 current_on = None
                 
     if current_on is not None:
         end_of_cycle = make_aware_lagos(datetime.now(lagos_tz)) if is_today else make_aware_lagos(end_dt)
-        cycles.append((current_on, end_of_cycle))
+        cycles.append((current_on, end_of_cycle, True if is_today else False))
         
     # Reconstruct outages (OFF periods) for the day
     outages = []
@@ -392,12 +392,18 @@ def generate_power_report(feeder, target_date, is_today=True):
             
         lines.append("")
         lines.append("🔹 Supply Log")
-        for on_time, off_time in cycles:
+        for item in cycles:
+            on_time = item[0]
+            off_time = item[1]
+            is_ongoing = item[2] if len(item) > 2 else False
             duration = off_time - on_time
             on_str = format_time_colon(on_time)
-            off_str = format_time_colon(off_time)
             dur_str = format_supply_log_duration(duration)
-            lines.append(f"- Power On: {on_str} → Power Off: {off_str} | ⏱️ Supply: {dur_str}")
+            if is_ongoing:
+                lines.append(f"- Power On: {on_str} → Present | ⏱️ Supply: {dur_str}")
+            else:
+                off_str = format_time_colon(off_time)
+                lines.append(f"- Power On: {on_str} → Power Off: {off_str} | ⏱️ Supply: {dur_str}")
             
         return "\n".join(lines)
 
