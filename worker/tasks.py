@@ -127,11 +127,49 @@ def format_duration(td):
         parts.append(f"{minutes}{m_str}")
     return " ".join(parts)
 
+def clean_and_format_whatsapp_recipients(raw_primary, raw_group=None):
+    import re
+    recipients = []
+
+    def process_item(item):
+        item = str(item).strip()
+        if not item:
+            return None
+        # WhatsApp group ID
+        if "@g.us" in item or "@us" in item:
+            clean_g = re.sub(r'\s+', '', item)
+            return clean_g if clean_g.endswith("@g.us") else f"{clean_g}@g.us"
+        
+        # Phone number cleanup
+        p_clean = re.sub(r'[\+\s\-\(\)]', '', item)
+        if p_clean.startswith('0') and len(p_clean) == 11 and p_clean.isdigit():
+            p_clean = '234' + p_clean[1:]
+        if p_clean.isdigit():
+            return f"{p_clean}@s.whatsapp.net"
+        elif "@" in p_clean:
+            return p_clean
+        return None
+
+    if raw_primary:
+        for part in re.split(r'[,\n;\r]+', str(raw_primary)):
+            formatted = process_item(part)
+            if formatted and formatted not in recipients:
+                recipients.append(formatted)
+
+    if raw_group:
+        for part in re.split(r'[,\n;\r]+', str(raw_group)):
+            formatted = process_item(part)
+            if formatted and formatted not in recipients:
+                recipients.append(formatted)
+
+    return recipients
+
+
 def send_whatsapp_power_message(number: str, message_body: str):
     """
     Send a text message via Evolution API.
     Recipients are resolved from Feeder.whatsapp_primary + Feeder.whatsapp_group,
-    falling back to Feeder.primary_recipient (legacy), then to the supplied number.
+    falling back to Feeder.primary_recipient (legacy), then to default recipients.
     """
     base_url = EVOLUTION_API_URL.rstrip('/')
     url = f"{base_url}/message/sendText/{POWER_INSTANCE}"
@@ -142,71 +180,34 @@ def send_whatsapp_power_message(number: str, message_body: str):
     
     recipients = []
     if number:
+        clean_num = str(number).strip()
         try:
             with engine.connect() as conn:
                 row = conn.execute(
                     text("""SELECT whatsapp_primary, whatsapp_group, primary_recipient
                              FROM myapp_feeder
-                             WHERE registered_phone = :num OR msisdn = :num OR sim_serial = :num OR name = :num
+                             WHERE LOWER(TRIM(name)) = LOWER(TRIM(:num))
+                                OR registered_phone = :clean
+                                OR msisdn = :clean
+                                OR sim_serial = :clean
+                                OR registered_phone = :num
                              LIMIT 1"""),
-                    {"num": number}
+                    {"num": clean_num, "clean": clean_num.replace("+", "").strip()}
                 ).fetchone()
                 if row:
                     wp_primary, wp_group, legacy_recipients = row
-                    import re
-                    if wp_primary:
-                        for p in re.split(r'[,\s;]+', str(wp_primary)):
-                            p_clean = p.replace("+", "").strip()
-                            if p_clean:
-                                formatted = f"{p_clean}@s.whatsapp.net" if "@" not in p_clean else p_clean
-                                if formatted not in recipients:
-                                    recipients.append(formatted)
-                    if wp_group:
-                        for g in re.split(r'[,\s;]+', str(wp_group)):
-                            g_clean = g.strip()
-                            if g_clean and g_clean not in recipients:
-                                recipients.append(g_clean)
-                    # Legacy fallback from primary_recipient
+                    recipients = clean_and_format_whatsapp_recipients(wp_primary, wp_group)
                     if not recipients and legacy_recipients:
-                        parts = re.split(r'[,\s;]+', legacy_recipients)
-                        for part in parts:
-                            part = part.strip().replace("(", "").replace(")", "")
-                            if not part:
-                                continue
-                            if "@" in part:
-                                if part not in recipients:
-                                    recipients.append(part)
-                            else:
-                                clean_p = part.replace("+", "").strip()
-                                if clean_p:
-                                    formatted = f"{clean_p}@s.whatsapp.net"
-                                    if formatted not in recipients:
-                                        recipients.append(formatted)
+                        recipients = clean_and_format_whatsapp_recipients(legacy_recipients)
             logger.info(f"WhatsApp recipients for {number}: {recipients}")
         except Exception as db_err:
             logger.error(f"Failed to lookup WhatsApp recipients for {number}: {db_err}")
 
-    # Fallback: if no recipients found in DB, use supplied number + defaults
+    # Fallback: if no recipients found in DB, use default primaries + default groups
     if not recipients:
-        import re
-        if number:
-            clean_number = number.replace("+", "").strip()
-            if clean_number:
-                formatted = f"{clean_number}@s.whatsapp.net" if "@" not in clean_number else clean_number
-                if formatted not in recipients:
-                    recipients.append(formatted)
-        default_primaries = "2348021299221, 2348108383472"
-        for p in re.split(r'[,\s;]+', default_primaries):
-            p_clean = p.replace("+", "").strip()
-            if p_clean:
-                formatted = f"{p_clean}@s.whatsapp.net" if "@" not in p_clean else p_clean
-                if formatted not in recipients:
-                    recipients.append(formatted)
-        default_groups = "120363410539285836@g.us, 120363429032532411@g.us"
-        for g in re.split(r'[,\s;]+', default_groups):
-            g_clean = g.strip()
-            if g_clean and g_clean not in recipients:
-                recipients.append(g_clean)
+        default_primaries = "2348021299221, 2349068770054"
+        default_groups = "120363410539285836@g.us, 120363429032532411@g.us, 120363429460546485@g.us"
+        recipients = clean_and_format_whatsapp_recipients(default_primaries, default_groups)
         
     last_response = None
     for recipient in recipients:
@@ -225,6 +226,8 @@ def send_whatsapp_power_message(number: str, message_body: str):
                 resp_json = response.json()
                 if last_response is None:
                     last_response = resp_json
+            else:
+                logger.error(f"Evolution API Error ({response.status_code}) for {recipient}: {response.text}")
         except Exception as e:
             logger.error(f"Failed to send WhatsApp power alert to {recipient}: {e}", exc_info=True)
             
