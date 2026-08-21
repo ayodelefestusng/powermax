@@ -292,7 +292,7 @@ def generate_power_report(feeder, target_date, is_today=True):
         if status_upper == 'ON':
             if current_on is None:
                 current_on = server_time_aware
-        elif status_upper == 'OFF':
+        elif status_upper in ('OFF', 'PARTIAL_OFF'):
             if current_on is not None:
                 cycles.append((current_on, server_time_aware, False))
                 current_on = None
@@ -355,7 +355,7 @@ def generate_power_report(feeder, target_date, is_today=True):
             for status, s_time in recent_updates:
                 status_upper = status.upper()
                 if s_time < current_since:
-                    if status_upper == "OFF":
+                    if status_upper in ("OFF", "PARTIAL_OFF"):
                         if last_off_time is None:
                             last_off_time = s_time
                         last_off_start = s_time
@@ -364,7 +364,7 @@ def generate_power_report(feeder, target_date, is_today=True):
             if last_off_start and current_since:
                 last_outage_duration = current_since - last_off_start
                 
-        elif current_status == "OFF" and current_since:
+        elif current_status in ("OFF", "PARTIAL_OFF") and current_since:
             last_on_time = None
             last_on_start = None
             for status, s_time in recent_updates:
@@ -374,12 +374,12 @@ def generate_power_report(feeder, target_date, is_today=True):
                         if last_on_time is None:
                             last_on_time = s_time
                         last_on_start = s_time
-                    elif status_upper == "OFF" and last_on_time is not None:
+                    elif status_upper in ("OFF", "PARTIAL_OFF") and last_on_time is not None:
                         break
             if last_on_start and current_since:
                 last_supply_duration = current_since - last_on_start
                 
-        status_icon = "🟢" if current_status == "ON" else "🔴"
+        status_icon = "🟢" if current_status == "ON" else ("🟡" if current_status == "PARTIAL_OFF" else "🔴")
         since_str = format_time_colon(current_since) if current_since else "N/A"
         
         lines = []
@@ -612,9 +612,8 @@ def send_test_email1():
         to_emails=["buyriteautosng@gmail.com"]
     )
 
-@celery_app.task(name="myapp.tasks.send_power_email", bind=True, default_retry_delay=15, max_retries=10, autoretry_for=(Exception,))
+@celery_app.task(name="myapp.tasks.send_power_email")
 def send_power_email(
-    self,
     feeder_name,
     status,
     device_time,
@@ -637,8 +636,9 @@ def send_power_email(
     
     is_pearl = (str(dt).upper() == "PEARL")
 
-    # 1. Database Persistence
+    # 1. Database Persistence & State Change Detection
     feeder = None
+    status_changed = True
     try:
         from worker.main import save_power_status_update, PowerStatus
         
@@ -650,7 +650,7 @@ def send_power_email(
             try:
                 server_time_dt = datetime.strptime(server_time, "%Y-%m-%d %H:%M:%S")
             except ValueError:
-                server_time_dt = datetime.now()
+                server_time_dt = datetime.now(lagos_tz)
         
         if server_time_dt.tzinfo is None:
             server_time_dt = lagos_tz.localize(server_time_dt)
@@ -667,8 +667,8 @@ def send_power_email(
             msisdn=msisdn
         )
         
-        # Save power status with phase data
-        feeder_id = save_power_status_update(
+        # Save power status with phase data and check if status actually changed
+        feeder_id, status_changed = save_power_status_update(
             data, server_time_dt,
             dt=dt,
             stat_r=stat_r, volt_r=volt_r,
@@ -686,8 +686,13 @@ def send_power_email(
                 feeder = FeederObj(feeder_id, feeder_name, contact_phone)
                 
     except Exception as db_err:
-        logger.error(f"Database persistence failed, task will be retried: {db_err}", exc_info=True)
-        raise db_err
+        logger.error(f"Database persistence failed: {db_err}", exc_info=True)
+        return
+
+    # If state did not transition, skip notifications (prevents telemetry packet spam/loops)
+    if not status_changed:
+        logger.info(f"Status for Feeder {feeder_name} unchanged ({status}). Telemetry logged to DB. Skipping alerts.")
+        return
 
     # 2. Build the report body
     if feeder is None:
@@ -740,12 +745,12 @@ def send_power_email(
         msg['Subject'] = subject
         msg.attach(MIMEText(body, 'plain'))
 
-        with smtplib.SMTP_SSL('smtp.gmail.com', 465, timeout=15) as server:
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465, timeout=5) as server:
             server.login(gmail_user, gmail_password)
             server.sendmail(gmail_user, to_email, msg.as_string())
         logger.info(f"Power alert email sent successfully to {to_email} for Feeder {feeder_name}")
     except Exception as e:
-        logger.error(f"Failed to send email alert for Feeder {feeder_name}: {e}", exc_info=True)
+        logger.error(f"Failed to send email alert for Feeder {feeder_name}: {e}")
 
     # 4. Send WhatsApp Alert
     try:
@@ -755,8 +760,7 @@ def send_power_email(
         else:
             logger.warning(f"No contact phone or feeder name available to send WhatsApp message for Feeder {feeder_name}")
     except Exception as exc:
-        logger.error(f"Task failed, will retry: {exc}", exc_info=True)
-        raise self.retry(exc=exc)
+        logger.error(f"Failed to send WhatsApp alert: {exc}", exc_info=True)
 @celery_app.task(name="myapp.tasks.send_daily_power_updates")
 def send_daily_power_updates():
     logger.info("Executing periodic daily power summary updates task")

@@ -279,6 +279,39 @@ def save_power_status_update(data: PowerStatus, server_time_dt,
                         "id": feeder_id
                     })
             
+            # Check previous power status for this feeder to detect actual state change
+            prev_status_query = text("""
+                SELECT status, stat_r, stat_y, stat_b 
+                FROM myapp_powerstatus 
+                WHERE feeder_id = :feeder_id 
+                ORDER BY server_time DESC 
+                LIMIT 1
+            """)
+            prev_record = conn.execute(prev_status_query, {"feeder_id": feeder_id}).fetchone()
+
+            is_pearl = (str(dt).upper() == "PEARL")
+            new_status_str = (data.status or "").strip().upper()
+            
+            if prev_record is None:
+                status_changed = True
+            else:
+                prev_status_str = (prev_record[0] or "").strip().upper()
+                if is_pearl and stat_r is not None:
+                    prev_r = (prev_record[1] or "").strip().upper()
+                    prev_y = (prev_record[2] or "").strip().upper()
+                    prev_b = (prev_record[3] or "").strip().upper()
+                    cur_r = (str(stat_r) or "").strip().upper()
+                    cur_y = (str(stat_y) or "").strip().upper()
+                    cur_b = (str(stat_b) or "").strip().upper()
+                    status_changed = (
+                        new_status_str != prev_status_str
+                        or cur_r != prev_r
+                        or cur_y != prev_y
+                        or cur_b != prev_b
+                    )
+                else:
+                    status_changed = (new_status_str != prev_status_str)
+
             # Save power status — includes three-phase columns for PEARL DT
             insert_status_query = text("""
                 INSERT INTO myapp_powerstatus (
@@ -308,8 +341,8 @@ def save_power_status_update(data: PowerStatus, server_time_dt,
                 "volt_b": volt_b,
                 "stat_b": stat_b,
             })
-            logger.info(f"Persisted power status update in database for feeder {data.feeder_name} [dt={dt}]")
-            return feeder_id
+            logger.info(f"Persisted power status update in database for feeder {data.feeder_name} [dt={dt}, changed={status_changed}]")
+            return feeder_id, status_changed
     except Exception as e:
         logger.error(f"Error persisting power status update for feeder {data.feeder_name}: {e}", exc_info=True)
         raise e
