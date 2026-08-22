@@ -281,13 +281,15 @@ def save_power_status_update(data: PowerStatus, server_time_dt,
             
             # Check previous power status for this feeder to detect actual state change
             prev_status_query = text("""
-                SELECT status, stat_r, stat_y, stat_b 
+                SELECT id, status, stat_r, stat_y, stat_b, server_time 
                 FROM myapp_powerstatus 
                 WHERE feeder_id = :feeder_id 
                 ORDER BY server_time DESC 
-                LIMIT 1
+                LIMIT 2
             """)
-            prev_record = conn.execute(prev_status_query, {"feeder_id": feeder_id}).fetchone()
+            prev_records = conn.execute(prev_status_query, {"feeder_id": feeder_id}).fetchall()
+            prev_record = prev_records[0] if prev_records else None
+            prev_prev_record = prev_records[1] if len(prev_records) > 1 else None
 
             is_pearl = (str(dt).upper() == "PEARL")
             new_status_str = (data.status or "").strip().upper()
@@ -295,11 +297,11 @@ def save_power_status_update(data: PowerStatus, server_time_dt,
             if prev_record is None:
                 status_changed = True
             else:
-                prev_status_str = (prev_record[0] or "").strip().upper()
+                prev_status_str = (prev_record[1] or "").strip().upper()
                 if is_pearl and stat_r is not None:
-                    prev_r = (prev_record[1] or "").strip().upper()
-                    prev_y = (prev_record[2] or "").strip().upper()
-                    prev_b = (prev_record[3] or "").strip().upper()
+                    prev_r = (prev_record[2] or "").strip().upper()
+                    prev_y = (prev_record[3] or "").strip().upper()
+                    prev_b = (prev_record[4] or "").strip().upper()
                     cur_r = (str(stat_r) or "").strip().upper()
                     cur_y = (str(stat_y) or "").strip().upper()
                     cur_b = (str(stat_b) or "").strip().upper()
@@ -311,6 +313,26 @@ def save_power_status_update(data: PowerStatus, server_time_dt,
                     )
                 else:
                     status_changed = (new_status_str != prev_status_str)
+
+                # Filter out 0-minute bounce / transient spike (< 60 seconds reverting to previous state)
+                if status_changed and prev_prev_record and prev_record[5]:
+                    prev_prev_status_str = (prev_prev_record[1] or "").strip().upper()
+                    if new_status_str == prev_prev_status_str:
+                        prev_time = prev_record[5]
+                        curr_time = server_time_dt
+                        if prev_time.tzinfo is None and curr_time.tzinfo is not None:
+                            prev_time = curr_time.tzinfo.localize(prev_time)
+                        elif prev_time.tzinfo is not None and curr_time.tzinfo is None:
+                            curr_time = prev_time.tzinfo.localize(curr_time)
+                        
+                        duration_diff = (curr_time - prev_time).total_seconds()
+                        if 0 <= duration_diff < 60:
+                            logger.info(
+                                f"Detected 0-min transient blip ({duration_diff:.1f}s) for feeder {data.feeder_name}. "
+                                f"Cleaning up transient record {prev_record[0]} and suppressing alert."
+                            )
+                            conn.execute(text("DELETE FROM myapp_powerstatus WHERE id = :id"), {"id": prev_record[0]})
+                            return feeder_id, False
 
             # Save power status — includes three-phase columns for PEARL DT
             insert_status_query = text("""

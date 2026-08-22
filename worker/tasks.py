@@ -17,9 +17,9 @@ if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
 
 # Evolution API Credentials
-EVOLUTION_API_URL = os.getenv("EVOLUTION_API_URL", "https://vectra-evolution-api.qgmg5v.easypanel.host")
-EVOLUTION_API_KEY = os.getenv("EVOLUTION_API_KEY", "")
-POWER_INSTANCE = os.getenv("POWER_INSTANCE", "power_max_bot")
+EVOLUTION_API_URL = os.getenv("EVOLUTION_API_URL", "https://vectra-evolution-api2.qgmg5v.easypanel.host")
+EVOLUTION_API_KEY = os.getenv("EVOLUTION_API_KEY", "4296843w3C4wwC977eeerr415CAwwed")
+POWER_INSTANCE = os.getenv("POWER_INSTANCE", "feeder_tracking")
 
 class FeederObj:
     def __init__(self, id, name, contact_phone, band=None):
@@ -73,7 +73,7 @@ def format_supply_log_duration(td):
             return f"{hours}h {minutes}m"
         return f"{hours}h"
     else:
-        if minutes == 1:
+        if minutes <= 1:
             return "1 min"
         return f"{minutes} mins"
 
@@ -91,7 +91,7 @@ def format_last_status_duration(td):
             return f"{hours}h {minutes}m"
         return f"{hours}h"
     else:
-        if minutes == 1:
+        if minutes <= 1:
             return "1min"
         return f"{minutes}mins"
 
@@ -294,12 +294,17 @@ def generate_power_report(feeder, target_date, is_today=True):
                 current_on = server_time_aware
         elif status_upper in ('OFF', 'PARTIAL_OFF'):
             if current_on is not None:
-                cycles.append((current_on, server_time_aware, False))
+                cycle_duration = server_time_aware - current_on
+                # Filter out 0-minute / < 60s transient blips
+                if cycle_duration.total_seconds() >= 60:
+                    cycles.append((current_on, server_time_aware, False))
                 current_on = None
                 
     if current_on is not None:
         end_of_cycle = make_aware_lagos(datetime.now(lagos_tz)) if is_today else make_aware_lagos(end_dt)
-        cycles.append((current_on, end_of_cycle, True if is_today else False))
+        cycle_duration = end_of_cycle - current_on
+        if is_today or cycle_duration.total_seconds() >= 60:
+            cycles.append((current_on, end_of_cycle, True if is_today else False))
         
     # Reconstruct outages (OFF periods) for the day
     outages = []
@@ -350,34 +355,24 @@ def generate_power_report(feeder, target_date, is_today=True):
         last_supply_duration = None
         
         if current_status == "ON" and current_since:
-            last_off_time = None
-            last_off_start = None
-            for status, s_time in recent_updates:
-                status_upper = status.upper()
-                if s_time < current_since:
-                    if status_upper in ("OFF", "PARTIAL_OFF"):
-                        if last_off_time is None:
-                            last_off_time = s_time
-                        last_off_start = s_time
-                    elif status_upper == "ON" and last_off_time is not None:
-                        break
-            if last_off_start and current_since:
-                last_outage_duration = current_since - last_off_start
+            if cycles:
+                # Last completed supply ended at cycles[-1][1] if current ON is cycles[-1] and ongoing
+                if len(cycles) > 1 and cycles[-1][2]:
+                    last_outage_duration = current_since - cycles[-2][1]
+                elif not cycles[-1][2]:
+                    last_outage_duration = current_since - cycles[-1][1]
+                else:
+                    last_outage_duration = current_since - make_aware_lagos(start_dt)
+            elif pre_update and pre_update[0].upper() in ("OFF", "PARTIAL_OFF"):
+                last_outage_duration = current_since - make_aware_lagos(pre_update[1])
+            else:
+                last_outage_duration = current_since - make_aware_lagos(start_dt)
                 
         elif current_status in ("OFF", "PARTIAL_OFF") and current_since:
-            last_on_time = None
-            last_on_start = None
-            for status, s_time in recent_updates:
-                status_upper = status.upper()
-                if s_time < current_since:
-                    if status_upper == "ON":
-                        if last_on_time is None:
-                            last_on_time = s_time
-                        last_on_start = s_time
-                    elif status_upper in ("OFF", "PARTIAL_OFF") and last_on_time is not None:
-                        break
-            if last_on_start and current_since:
-                last_supply_duration = current_since - last_on_start
+            if cycles:
+                last_completed_cycle = [c for c in cycles if not c[2]]
+                if last_completed_cycle:
+                    last_supply_duration = last_completed_cycle[-1][1] - last_completed_cycle[-1][0]
                 
         status_icon = "🟢" if current_status == "ON" else ("🟡" if current_status == "PARTIAL_OFF" else "🔴")
         since_str = format_time_colon(current_since) if current_since else "N/A"
@@ -401,6 +396,8 @@ def generate_power_report(feeder, target_date, is_today=True):
             off_time = item[1]
             is_ongoing = item[2] if len(item) > 2 else False
             duration = off_time - on_time
+            if not is_ongoing and duration.total_seconds() < 60:
+                continue
             on_str = format_time_colon(on_time)
             dur_str = format_supply_log_duration(duration)
             if is_ongoing:
