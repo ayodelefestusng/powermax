@@ -645,7 +645,8 @@ async def create_attendance(data: AttendanceRequest):
             logger.info(f"Recorded attendance for student {data.student_id} under tenant {data.tenant_code}: {status_lower} at {now_local}")
             
             # 4. Asynchronously send WhatsApp message to the guardian_phone if available
-            if guardian_phone and evolution_instance:
+            target_instance = evolution_instance.strip() if (evolution_instance and evolution_instance.strip() not in ("", "Hhh")) else os.getenv("POWER_INSTANCE", "feeder_tracking")
+            if guardian_phone and target_instance:
                 if status_lower == 'in':
                     message = f"{student_name} has arrived school"
                 else:
@@ -653,10 +654,10 @@ async def create_attendance(data: AttendanceRequest):
                     message = f"{student_name} has left school at {time_str}"
                 
                 # Resolve API URL and Key
-                api_url = os.getenv("EVOLUTION_API_URL", "https://vectra-evolution-api.qgmg5v.easypanel.host")
+                api_url = os.getenv("EVOLUTION_API_URL", "https://vectra-evolution-api2.qgmg5v.easypanel.host")
                 api_key = os.getenv("EVOLUTION_API_KEY", "4296843w3C4wwC977eeerr415CAwwed")
                 
-                if tenant_evolution_api:
+                if tenant_evolution_api and tenant_evolution_api.strip() not in ("", "Hhh"):
                     val = tenant_evolution_api.strip()
                     if val.startswith("http://") or val.startswith("https://"):
                         api_url = val
@@ -666,9 +667,9 @@ async def create_attendance(data: AttendanceRequest):
                 try:
                     celery_app.send_task(
                         "myapp.tasks.send_attendance_whatsapp",
-                        args=[api_url, api_key, evolution_instance, guardian_phone, message]
+                        args=[api_url, api_key, target_instance, guardian_phone, message]
                     )
-                    logger.info(f"Enqueued Celery task send_attendance_whatsapp for guardian of {student_name} (Phone: {guardian_phone})")
+                    logger.info(f"Enqueued Celery task send_attendance_whatsapp for guardian of {student_name} (Phone: {guardian_phone}, Instance: {target_instance})")
                 except Exception as celery_err:
                     logger.error(f"Could not send attendance WhatsApp task to Celery: {celery_err}")
                 
@@ -685,7 +686,7 @@ async def create_attendance(data: AttendanceRequest):
 
 @app.get("/utility/")
 def read_root():
-    return {"message": "Hello from SIM 900 20082026v2 timestap v126"}
+    return {"message": "Hello from SIM 900 20082026v2 timestap v126vvv"}
 
 
 @app.api_route("/testing", methods=["GET", "POST"])
