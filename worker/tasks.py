@@ -165,11 +165,11 @@ def clean_and_format_whatsapp_recipients(raw_primary, raw_group=None):
     return recipients
 
 
-def send_whatsapp_power_message(number: str, message_body: str):
+def send_whatsapp_power_message(number: str, message_body: str, feeder_id=None, feeder_name=None):
     """
     Send a text message via Evolution API.
-    Recipients are resolved from Feeder.whatsapp_primary + Feeder.whatsapp_group,
-    falling back to Feeder.primary_recipient (legacy), then to default recipients.
+    Recipients are resolved from the exact feeder when its ID or name is supplied.
+    Phone/name lookup remains as a fallback for legacy callers.
     """
     base_url = EVOLUTION_API_URL.rstrip('/')
     url = f"{base_url}/message/sendText/{POWER_INSTANCE}"
@@ -179,7 +179,33 @@ def send_whatsapp_power_message(number: str, message_body: str):
     }
     
     recipients = []
-    if number:
+    if feeder_id is not None or feeder_name:
+        try:
+            with engine.connect() as conn:
+                if feeder_id is not None:
+                    row = conn.execute(
+                        text("""SELECT whatsapp_primary, whatsapp_group, primary_recipient
+                                 FROM myapp_feeder WHERE id = :feeder_id"""),
+                        {"feeder_id": feeder_id}
+                    ).fetchone()
+                else:
+                    row = conn.execute(
+                        text("""SELECT whatsapp_primary, whatsapp_group, primary_recipient
+                                 FROM myapp_feeder
+                                 WHERE LOWER(TRIM(name)) = LOWER(TRIM(:feeder_name))
+                                 LIMIT 1"""),
+                        {"feeder_name": feeder_name}
+                    ).fetchone()
+                if row:
+                    wp_primary, wp_group, legacy_recipients = row
+                    recipients = clean_and_format_whatsapp_recipients(wp_primary, wp_group)
+                    if not recipients and legacy_recipients:
+                        recipients = clean_and_format_whatsapp_recipients(legacy_recipients)
+            logger.info(f"WhatsApp recipients for feeder {feeder_id or feeder_name}: {recipients}")
+        except Exception as db_err:
+            logger.error(f"Failed to lookup WhatsApp recipients for feeder {feeder_id or feeder_name}: {db_err}")
+
+    if not recipients and number:
         clean_num = str(number).strip()
         try:
             with engine.connect() as conn:
@@ -753,7 +779,7 @@ def send_power_email(
     try:
         phone_to_use = contact_phone or feeder.contact_phone or feeder.name or feeder_name
         if phone_to_use:
-            send_whatsapp_power_message(phone_to_use, body)
+            send_whatsapp_power_message(phone_to_use, body, feeder_id=feeder.id)
         else:
             logger.warning(f"No contact phone or feeder name available to send WhatsApp message for Feeder {feeder_name}")
     except Exception as exc:
@@ -806,7 +832,7 @@ def send_daily_power_updates():
             # Send WhatsApp
             phone_to_use = feeder.contact_phone or feeder.name
             if phone_to_use:
-                send_whatsapp_power_message(phone_to_use, body)
+                send_whatsapp_power_message(phone_to_use, body, feeder_id=feeder.id)
             else:
                 logger.info(f"No contact phone or feeder name available to send daily summary WhatsApp for Feeder {feeder.name}")
                 
