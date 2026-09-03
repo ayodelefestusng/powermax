@@ -686,7 +686,7 @@ async def create_attendance(data: AttendanceRequest):
 
 @app.get("/utility/")
 def read_root():
-    return {"message": "Hello from SIM 900 20082026v2 timestap v126vvv"}
+    return {"message": "Hello from SIM 900 20082026v2 timestap RabbitMQ"}
 
 
 @app.api_route("/testing", methods=["GET", "POST"])
