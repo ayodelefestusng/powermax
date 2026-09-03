@@ -905,3 +905,21 @@ def send_attendance_whatsapp(api_url: str, api_key: str, instance: str, phone: s
             logger.error(f"Evolution API Error ({response.status_code}): {response.text}")
     except Exception as e:
         logger.error(f"Failed to send attendance WhatsApp notification: {e}", exc_info=True)
+
+
+@celery_app.task(name="myapp.tasks.get_broker_info")
+def get_broker_info():
+    """
+    Diagnostic task to verify active broker and backend connectivity status.
+    """
+    import re
+    from worker.celery_app import BROKER_TYPE, BROKER_URL, BACKEND_URL
+    masked_broker = re.sub(r':([^@:]+)@', ':***@', str(BROKER_URL))
+    masked_backend = re.sub(r':([^@:]+)@', ':***@', str(BACKEND_URL))
+    return {
+        "status": "online",
+        "broker_type": BROKER_TYPE,
+        "broker": masked_broker,
+        "backend": masked_backend,
+    }
+
