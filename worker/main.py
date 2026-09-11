@@ -689,18 +689,237 @@ def read_root():
     return {"message": "Hello from SIM 900 20082026v2 timestap RabbitMQ made default"}
 
 
-@app.api_route("/testing", methods=["GET", "POST"])
-async def testing_endpoint(request: Request):
-    logger.info("Testing endpoint called")
-    headers = {"Connection": "close", "Content-Type": "application/json"}
-    return JSONResponse(
-        status_code=status.HTTP_200_OK,
-        headers=headers,
-        content={
+@app.api_route("/feeder_lookup", methods=["GET", "POST"])
+@app.api_route("/feeder_lookup/", methods=["GET", "POST"])
+async def feeder_lookup(
+    request: Request,
+    meter_number: Optional[str] = None,
+    meter: Optional[str] = None,
+    account_number: Optional[str] = None
+):
+    """
+    Look up feeder and band information from Ikeja Electric customer feeder verification.
+    Accepts meter/account number via GET query parameter (?meter_number=...) or POST JSON payload.
+    """
+    input_meter = meter_number or meter or account_number
+
+    if request.method == "POST":
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                input_meter = (
+                    body.get("meter_number")
+                    or body.get("meter")
+                    or body.get("account_number")
+                    or body.get("account")
+                    or input_meter
+                )
+        except Exception:
+            pass
+
+    if not input_meter or not str(input_meter).strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing meter_number or account_number parameter"
+        )
+
+    clean_meter = str(input_meter).strip()
+    logger.info(f"feeder_lookup requested for meter/account: {clean_meter}")
+
+    powerbi_resource_key = "f8264200-5ceb-480f-996f-c9b09e656b97"
+    powerbi_model_id = 1579241
+    powerbi_report_id = 1977301
+    powerbi_cluster_api = "https://wabi-north-europe-l-primary-api.analysis.windows.net"
+
+    import uuid
+    url = f"{powerbi_cluster_api}/public/reports/querydata?synchronous=true"
+    headers = {
+        "Accept": "application/json",
+        "ActivityId": str(uuid.uuid4()),
+        "RequestId": str(uuid.uuid4()),
+        "X-PowerBI-ResourceKey": powerbi_resource_key,
+        "Content-Type": "application/json;charset=UTF-8",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    }
+
+    query_payload = {
+        "version": "1.0.0",
+        "queries": [
+            {
+                "Query": {
+                    "Commands": [
+                        {
+                            "SemanticQueryDataShapeCommand": {
+                                "Query": {
+                                    "Version": 2,
+                                    "From": [{"Name": "a", "Entity": "All", "Type": 0}],
+                                    "Select": [
+                                        {
+                                            "Column": {
+                                                "Expression": {"SourceRef": {"Source": "a"}},
+                                                "Property": "ACCOUNT_NUMBER"
+                                            },
+                                            "Name": "All.ACCOUNT_NUMBER"
+                                        },
+                                        {
+                                            "Column": {
+                                                "Expression": {"SourceRef": {"Source": "a"}},
+                                                "Property": "NAME_OF_FEEDER"
+                                            },
+                                            "Name": "All.NAME_OF_FEEDER"
+                                        },
+                                        {
+                                            "Column": {
+                                                "Expression": {"SourceRef": {"Source": "a"}},
+                                                "Property": "FEEDER_BAND"
+                                            },
+                                            "Name": "All.FEEDER_BAND"
+                                        }
+                                    ],
+                                    "Where": [
+                                        {
+                                            "Condition": {
+                                                "Contains": {
+                                                    "Left": {
+                                                        "Column": {
+                                                            "Expression": {"SourceRef": {"Source": "a"}},
+                                                            "Property": "ACCOUNT_NUMBER"
+                                                        }
+                                                    },
+                                                    "Right": {
+                                                        "Literal": {
+                                                            "Value": f"'{clean_meter}'"
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    ]
+                                },
+                                "Binding": {
+                                    "Primary": {
+                                        "Groupings": [{"Projections": [0, 1, 2]}]
+                                    },
+                                    "DataReduction": {
+                                        "DataVolume": 3,
+                                        "Primary": {"Window": {"Count": 10}}
+                                    },
+                                    "Version": 1
+                                },
+                                "ExecutionMetricsKind": 1
+                            }
+                        }
+                    ]
+                },
+                "QueryId": "",
+                "ApplicationContext": {
+                    "DatasetId": str(powerbi_model_id),
+                    "Sources": [{"ReportId": str(powerbi_report_id)}]
+                }
+            }
+        ],
+        "cancelQueries": [],
+        "modelId": powerbi_model_id
+    }
+
+    try:
+        response = requests.post(url, headers=headers, json=query_payload, timeout=20)
+        if response.status_code != 200:
+            logger.error(f"PowerBI API returned status {response.status_code}: {response.text[:200]}")
+            return JSONResponse(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                content={
+                    "status": "error",
+                    "message": f"Failed to fetch data from Ikeja Electric verification service (Status {response.status_code})"
+                }
+            )
+
+        data = response.json()
+        results = data.get("results", [])
+        if not results:
+            return JSONResponse(
+                status_code=status.HTTP_404_NOT_FOUND,
+                content={"status": "not_found", "message": f"No feeder details found for '{clean_meter}'"}
+            )
+
+        dsr = results[0].get("result", {}).get("data", {}).get("dsr", {})
+        ds_list = dsr.get("DS", [])
+        if not ds_list:
+            return JSONResponse(
+                status_code=status.HTTP_404_NOT_FOUND,
+                content={"status": "not_found", "message": f"No feeder details found for '{clean_meter}'"}
+            )
+
+        ds = ds_list[0]
+        value_dicts = ds.get("ValueDicts", {})
+        d0 = value_dicts.get("D0", [])
+        d1 = value_dicts.get("D1", [])
+        d2 = value_dicts.get("D2", [])
+
+        ph = ds.get("PH", [])
+        records = []
+        last_row = [None, None, None]
+
+        for p in ph:
+            dm0 = p.get("DM0", [])
+            for item in dm0:
+                c = item.get("C", [])
+                r_mask = item.get("R", 0)
+
+                cur_row = list(last_row)
+                c_idx = 0
+                for col_i in range(3):
+                    is_repeated = bool(r_mask & (1 << (2 - col_i))) if r_mask else False
+                    if not is_repeated:
+                        if c_idx < len(c):
+                            val = c[c_idx]
+                            c_idx += 1
+                            if col_i == 0:
+                                cur_row[0] = d0[val] if isinstance(val, int) and val < len(d0) else str(val)
+                            elif col_i == 1:
+                                cur_row[1] = d1[val] if isinstance(val, int) and val < len(d1) else str(val)
+                            elif col_i == 2:
+                                cur_row[2] = d2[val] if isinstance(val, int) and val < len(d2) else str(val)
+
+                last_row = list(cur_row)
+                if cur_row[0] or cur_row[1]:
+                    records.append({
+                        "account_number": cur_row[0],
+                        "feeder": cur_row[1],
+                        "band": cur_row[2]
+                    })
+
+        if not records:
+            return JSONResponse(
+                status_code=status.HTTP_404_NOT_FOUND,
+                content={
+                    "status": "not_found",
+                    "meter_number": clean_meter,
+                    "message": f"No feeder details found for meter/account '{clean_meter}'"
+                }
+            )
+
+        primary = records[0]
+        return {
             "status": "success",
-            "message": "Testing endpoint operational",
-            "timestamp": datetime.now(timezone(timedelta(hours=1))).strftime("%Y-%m-%d %H:%M:%S")
+            "meter_number": clean_meter,
+            "account_number": primary.get("account_number"),
+            "feeder": primary.get("feeder"),
+            "band": primary.get("band"),
+            "matches": records
         }
-    )
+
+    except requests.exceptions.Timeout:
+        logger.error(f"Timeout querying Ikeja Electric feeder for meter {clean_meter}")
+        return JSONResponse(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            content={"status": "error", "message": "Request to Ikeja Electric verification service timed out"}
+        )
+    except Exception as e:
+        logger.error(f"Error querying Ikeja Electric feeder: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"status": "error", "message": str(e)}
+        )
 
 
