@@ -1,0 +1,17 @@
+.pio
+.vscode/
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+*.elf
+*.bin
+*.hex
+*.uf2
+*.map
+*.a
+*.o
+*.d
+.DS_Store
+Thumbs.db
