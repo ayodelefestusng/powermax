@@ -28,28 +28,28 @@
 #include <cmath>
 #include <vector>
 
-// ─── ADC Pin Definitions ────────────────────────────────────
-const int ADC_PIN_RED    = 36; // VP
-const int ADC_PIN_YELLOW = 39; // VN
-const int ADC_PIN_BLUE   = 34; // D34
+// ─── Pin Configurations ──────────────────────────────────────
+const int ADC_PIN_RED    = 36; // VP (GPIO 36)
+const int ADC_PIN_YELLOW = 39; // VN (GPIO 39)
+const int ADC_PIN_BLUE   = 34; // GPIO 34
 
 // ─── Thresholds & State Logic ────────────────────────────────
 const float VOLTAGE_THRESHOLD_ON  = 95.0f;  
-const float VOLTAGE_THRESHOLD_OFF = 65.0f;  
-const float MAX_VALID_VOLTAGE     = 280.0f;
+const float VOLTAGE_THRESHOLD_OFF = 50.0f;  
+const float MAX_PHASE_VOLTAGE     = 200.0f; // Safeguard cap: Max voltage limit for any phase
+const int   CONFIRMATION_CYCLES   = 5;      // Increased confirmation window to block transient bursts
 
 // ─── Calibration Gains & Offsets ─────────────────────────────
-const float CAL_GAIN_R   = 12.968f;
+const float CAL_GAIN_R   = 5.600f;  
 const float CAL_OFFSET_R = 0.00f;
 
-const float CAL_GAIN_Y   = 0.4598f; 
+const float CAL_GAIN_Y   = 0.3950f; 
 const float CAL_OFFSET_Y = 0.00f;
 
-const float CAL_GAIN_B   = 0.4802f; 
+const float CAL_GAIN_B   = 0.4500f; 
 const float CAL_OFFSET_B = 0.00f;
 
-const float NOISE_FLOOR_CUTOFF = 5.0f;
-const float RED_NOISE_FLOOR_CUTOFF = 10.0f;
+const float NOISE_FLOOR_CUTOFF = 35.0f; 
 
 // ─── GSM UART (ESP32 HardwareSerial 2) ──────────────────────
 const int GSM_RX_PIN  = 16; // GPIO16 ← GSM TXD
@@ -118,8 +118,11 @@ bool lastStateR = false;
 bool lastStateY = false;
 bool lastStateB = false;
 
+int consecutiveValidR = 0;
+int consecutiveValidY = 0;
+int consecutiveValidB = 0;
+
 // ─── FIFO Queue & Backoff Engine ────────────────────────────
-// Retry backoff intervals: 3s, 10s, 30s, 60s, 120s
 const uint32_t BACKOFF_INTERVALS_MS[] = {3000, 10000, 30000, 60000, 120000};
 const uint8_t MAX_BACKOFF_INDEX       = 4;
 
@@ -129,9 +132,9 @@ bool is_retry_active           = false;
 
 // ─── Function Prototypes ────────────────────────────────────
 PhaseReadings readPhaseSensors();
-float calculateRMS(const std::vector<int>& samples, float gain, float offset, const char* phaseLabel);
+float calculateRMS(std::vector<int>& samples, float gain, float offset, const char* phaseLabel);
 float updatePhaseFilter(float currentSmooth, float rawVolts);
-bool evaluatePhaseState(float volts, bool currentState);
+bool evaluatePhaseState(float rawVolts, bool currentState, int& counter);
 
 bool initWiFi();
 bool initGSM();
@@ -320,7 +323,7 @@ uint32_t getCurrentTimestamp() {
 void setup() {
     try {
         Serial.begin(115200);
-        delay(200);
+        delay(1000);
         Serial.println(F("\n=== PEARL DT — Three-Phase Power Tracker Boot ==="));
 
         // Configure ADC pins and 11dB attenuation
@@ -473,7 +476,6 @@ void loop() {
                     uint32_t eventTs = getCurrentTimestamp();
                     enqueueEvent(current, eventTs);
 
-                    // Dispatch a state-change event immediately; backoff is only for failures.
                     if (flushQueue()) {
                         is_retry_active = false;
                         backoff_index = 0;
@@ -493,7 +495,7 @@ void loop() {
             if (hasPendingQueue()) {
                 is_retry_active = true;
                 backoff_index = 0;
-                last_retry_ms = 0; // Trigger immediate flush
+                last_retry_ms = 0;
             }
         } else if (wifi_connected && WiFi.status() != WL_CONNECTED) {
             wifi_connected = false;
@@ -534,12 +536,22 @@ void loop() {
 }
 
 // ════════════════════════════════════════════════════════════
-// TRUE RMS CALCULATOR WITH DYNAMIC MIDPOINT BIAS
+// TRUE RMS CALCULATOR WITH OUTLIER SPIKE REJECTION & 200V CAP
 // ════════════════════════════════════════════════════════════
-float calculateRMS(const std::vector<int>& samples, float gain, float offset, const char* phaseLabel) {
-    if (samples.empty()) return 0.0f;
+float calculateRMS(std::vector<int>& samples, float gain, float offset, const char* phaseLabel) {
+    if (samples.size() < 20) return 0.0f;
 
     try {
+        // Guardrail: Sort samples to strip out extreme impulse noise / ADC glitches
+        std::sort(samples.begin(), samples.end());
+        
+        // Trim top and bottom 5% extreme values to eliminate single-point transient spikes
+        size_t trimCount = samples.size() / 20; 
+        if (trimCount > 0 && samples.size() > (2 * trimCount)) {
+            samples.erase(samples.begin(), samples.begin() + trimCount);
+            samples.erase(samples.end() - trimCount, samples.end());
+        }
+
         double sumSamples = 0.0;
         for (int raw : samples) {
             sumSamples += raw;
@@ -555,18 +567,16 @@ float calculateRMS(const std::vector<int>& samples, float gain, float offset, co
         double meanSquare = sumSquaredDiff / static_cast<double>(samples.size());
         float rawRms = static_cast<float>(std::sqrt(meanSquare));
 
-        float noiseFloorCutoff = NOISE_FLOOR_CUTOFF;
-        if (phaseLabel != nullptr && phaseLabel[0] == 'R') {
-            noiseFloorCutoff = RED_NOISE_FLOOR_CUTOFF;
-        }
-
-        if (rawRms < noiseFloorCutoff) {
+        if (rawRms < NOISE_FLOOR_CUTOFF) {
             return 0.0f;
         }
 
-        return (rawRms * gain) + offset;
+        float calculatedVolts = (rawRms * gain) + offset;
+        
+        // Safeguard Cap: Ensure reading does not exceed 200V
+        return (calculatedVolts > MAX_PHASE_VOLTAGE) ? MAX_PHASE_VOLTAGE : calculatedVolts;
     } catch (...) {
-        Serial.println(F("[ERROR] Exception trapped during RMS calculation."));
+        Serial.printf("[ERROR] Exception trapped during RMS calculation for Phase %s.\n", phaseLabel);
         return 0.0f;
     }
 }
@@ -576,16 +586,12 @@ float calculateRMS(const std::vector<int>& samples, float gain, float offset, co
 // ════════════════════════════════════════════════════════════
 float updatePhaseFilter(float currentSmooth, float rawVolts) {
     try {
-        if (currentSmooth < 10.0f && rawVolts >= 15.0f) {
-            return rawVolts;
+        if (rawVolts < VOLTAGE_THRESHOLD_OFF) {
+            return 0.0f; 
         }
 
-        if (rawVolts < 15.0f && currentSmooth > 50.0f) {
+        if (currentSmooth < 10.0f && rawVolts >= VOLTAGE_THRESHOLD_ON) {
             return rawVolts;
-        }
-
-        if (rawVolts < 10.0f && currentSmooth < 15.0f) {
-            return 0.0f;
         }
 
         float diff = std::fabs(rawVolts - currentSmooth);
@@ -605,16 +611,32 @@ float updatePhaseFilter(float currentSmooth, float rawVolts) {
     }
 }
 
-bool evaluatePhaseState(float volts, bool currentState) {
-    if (currentState) {
-        return (volts >= VOLTAGE_THRESHOLD_OFF);
-    } else {
-        return (volts >= VOLTAGE_THRESHOLD_ON);
+bool evaluatePhaseState(float rawVolts, bool currentState, int& counter) {
+    try {
+        if (currentState) {
+            if (rawVolts < VOLTAGE_THRESHOLD_OFF) {
+                counter = 0;
+                return false;
+            }
+            return true;
+        } else {
+            if (rawVolts >= VOLTAGE_THRESHOLD_ON) {
+                counter++;
+                if (counter >= CONFIRMATION_CYCLES) {
+                    return true;
+                }
+            } else {
+                counter = 0; 
+            }
+            return false;
+        }
+    } catch (...) {
+        return false;
     }
 }
 
 // ════════════════════════════════════════════════════════════
-// PHASE SENSOR SAMPLING & SENSING ENGINE
+// SENSOR SAMPLING LOOP
 // ════════════════════════════════════════════════════════════
 PhaseReadings readPhaseSensors() {
     PhaseReadings data = {0.0f, 0.0f, 0.0f, false, false, false, false};
@@ -628,7 +650,6 @@ PhaseReadings readPhaseSensors() {
         samplesY.reserve(300);
         samplesB.reserve(300);
 
-        // Sample across 200ms (~10 full 50Hz cycles)
         unsigned long start = millis();
         while (millis() - start < 200UL) {
             int r = analogRead(ADC_PIN_RED);
@@ -642,33 +663,45 @@ PhaseReadings readPhaseSensors() {
             delayMicroseconds(150);
         }
 
-        // Calculate RMS per phase
         float rawVoltsR = calculateRMS(samplesR, CAL_GAIN_R, CAL_OFFSET_R, "R");
         float rawVoltsY = calculateRMS(samplesY, CAL_GAIN_Y, CAL_OFFSET_Y, "Y");
         float rawVoltsB = calculateRMS(samplesB, CAL_GAIN_B, CAL_OFFSET_B, "B");
 
-        // Cap at upper limit
-        rawVoltsR = std::min(rawVoltsR, MAX_VALID_VOLTAGE);
-        rawVoltsY = std::min(rawVoltsY, MAX_VALID_VOLTAGE);
-        rawVoltsB = std::min(rawVoltsB, MAX_VALID_VOLTAGE);
+        lastStateR = evaluatePhaseState(rawVoltsR, lastStateR, consecutiveValidR);
+        lastStateY = evaluatePhaseState(rawVoltsY, lastStateY, consecutiveValidY);
+        lastStateB = evaluatePhaseState(rawVoltsB, lastStateB, consecutiveValidB);
 
-        // Exponential smoothing filter
-        smoothR = updatePhaseFilter(smoothR, rawVoltsR);
-        smoothY = updatePhaseFilter(smoothY, rawVoltsY);
-        smoothB = updatePhaseFilter(smoothB, rawVoltsB);
+        if (lastStateR) {
+            smoothR = updatePhaseFilter(smoothR, rawVoltsR);
+        } else {
+            smoothR = 0.0f;
+            consecutiveValidR = 0;
+        }
+
+        if (lastStateY) {
+            smoothY = updatePhaseFilter(smoothY, rawVoltsY);
+        } else {
+            smoothY = 0.0f;
+            consecutiveValidY = 0;
+        }
+
+        if (lastStateB) {
+            smoothB = updatePhaseFilter(smoothB, rawVoltsB);
+        } else {
+            smoothB = 0.0f;
+            consecutiveValidB = 0;
+        }
 
         data.voltsR = smoothR;
         data.voltsY = smoothY;
         data.voltsB = smoothB;
 
-        // Return candidates only. The main loop commits them after debounce.
-        data.stateR = evaluatePhaseState(data.voltsR, lastStateR);
-        data.stateY = evaluatePhaseState(data.voltsY, lastStateY);
-        data.stateB = evaluatePhaseState(data.voltsB, lastStateB);
-
+        data.stateR = lastStateR;
+        data.stateY = lastStateY;
+        data.stateB = lastStateB;
         data.readSuccess = true;
-        return data;
 
+        return data;
     } catch (...) {
         Serial.println(F("[ERROR] Exception in readPhaseSensors execution."));
         data.readSuccess = false;
@@ -897,12 +930,10 @@ bool flushQueue() {
             p_cached.readSuccess = true;
 
             bool sent = false;
-            // Route 1: WiFi HTTP
             if (WiFi.status() == WL_CONNECTED) {
                 sent = sendHTTPWiFi(p_cached, ts_cached);
             }
 
-            // Route 2: GSM GPRS HTTP
             if (!sent) {
                 if (!gsm_connected) {
                     gsm_connected = initGSM();
