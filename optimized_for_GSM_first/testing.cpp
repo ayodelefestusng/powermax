@@ -23,8 +23,8 @@
 // ==========================================
 // CALIBRATED HARDWARE THRESHOLDS & FILTERING
 // ==========================================
-const int ADC_OFF_BASE        = 35;  
-const int ADC_THRESHOLD       = 80;  
+const int ADC_OFF_BASE        = 60;   
+const int ADC_THRESHOLD       = 90;  
 const int CONSECUTIVE_SAMPLES = 3;   
 
 #define AC_SAMPLE_WINDOW_MS   100    
@@ -44,8 +44,8 @@ const char* wifi_password     = "@Ajibandele612";
 const unsigned long WIFI_TIMEOUT_MS = 15000UL;
 
 // Static Node Metadata
-const char* FEEDER_NAME       = "Igbogbo";
-const char* TRANSFORMER_NAME  = "Igbogbo Sabo DT";
+const char* FEEDER_NAME       = "Testing ";
+const char* TRANSFORMER_NAME  = "Testing  DT";
 const char* USER_LATITUDE     = "6.5230";
 const char* USER_LONGITUDE    = "3.3420";
 
@@ -520,6 +520,8 @@ bool sendTelemetryHttpGPRS(const String& status, uint32_t timestamp, uint16_t pe
 // Unified Transmission Dispatch: Tries WiFi first, then GSM
 bool transmitEventNow(const String& status, uint32_t timestamp, uint16_t peakVal) {
     try {
+        logInfo("Preparing to send event to server: status=" + status + ", timestamp=" + String(timestamp) + ", peak=" + String(peakVal));
+
         // 1. Try WiFi first (Fastest & Free)
         if (WiFi.status() == WL_CONNECTED) {
             if (sendTelemetryHttpWiFi(status, timestamp, peakVal)) {
@@ -554,12 +556,66 @@ void enqueueEvent(const String& status, uint32_t timestamp, uint16_t peakVal) {
         String lineRecord = status + "," + String(timestamp) + "," + String(peakVal) + "," + String(USER_LATITUDE) + "," + String(USER_LONGITUDE) + "\n";
         cache.print(lineRecord);
         cache.close();
+        logInfo("Event persisted locally before network send: status=" + status + ", ts=" + String(timestamp) + ", peak=" + String(peakVal));
         // Enable retry backoff cycle
         isRetryActive = true;
         backoffIndex = 0;
         lastRetryAttemptMs = millis();
     } catch (...) {
         logError("Exception in enqueueEvent.");
+    }
+}
+
+bool removeQueuedEvent(const String& status, uint32_t timestamp, uint16_t peakVal) {
+    try {
+        if (!LittleFS.exists(CACHE_FILE_PATH)) return true;
+
+        File cache = LittleFS.open(CACHE_FILE_PATH, "r");
+        if (!cache) return false;
+
+        String tempPath = "/temp_queue_remove.json";
+        File tempCache = LittleFS.open(tempPath, "w");
+        if (!tempCache) {
+            cache.close();
+            return false;
+        }
+
+        bool removed = false;
+        while (cache.available()) {
+            String record = cache.readStringUntil('\n');
+            record.trim();
+            if (record.length() < 5) continue;
+
+            int idx1 = record.indexOf(',');
+            int idx2 = record.indexOf(',', idx1 + 1);
+            int idx3 = record.indexOf(',', idx2 + 1);
+
+            if (idx1 != -1 && idx2 != -1 && idx3 != -1) {
+                String recStatus = record.substring(0, idx1);
+                uint32_t recTimestamp = record.substring(idx1 + 1, idx2).toInt();
+                uint16_t recPeak = record.substring(idx2 + 1, idx3).toInt();
+
+                if (!removed && recStatus == status && recTimestamp == timestamp && recPeak == peakVal) {
+                    removed = true;
+                    continue;
+                }
+            }
+
+            tempCache.println(record);
+        }
+
+        cache.close();
+        tempCache.close();
+
+        LittleFS.remove(CACHE_FILE_PATH);
+        if (LittleFS.exists(tempPath)) {
+            LittleFS.rename(tempPath, CACHE_FILE_PATH);
+        }
+
+        return true;
+    } catch (...) {
+        logError("Exception in removeQueuedEvent.");
+        return false;
     }
 }
 
@@ -684,15 +740,19 @@ void setup() {
             }
         }
 
-        // Capture initial boot state & send immediately
+        // Capture initial boot state & persist before any send attempt
         lastPowerStatus = readPowerStatus(false);
         uint32_t initTs = getCurrentTimestamp();
         uint16_t initPeak = getFilteredAnalogPeak();
+        String initialState = lastPowerStatus ? "on" : "off";
         
         logInfo("Initial Power Status -> " + String(lastPowerStatus ? "ON" : "OFF"));
-        
-        if (!transmitEventNow(lastPowerStatus ? "on" : "off", initTs, initPeak)) {
-            enqueueEvent(lastPowerStatus ? "on" : "off", initTs, initPeak);
+        enqueueEvent(initialState, initTs, initPeak);
+
+        if (!transmitEventNow(initialState, initTs, initPeak)) {
+            logError("Initial transmission failed. Event remains queued for retry.");
+        } else {
+            removeQueuedEvent(initialState, initTs, initPeak);
         }
     } catch (...) {
         logError("Fatal exception in setup.");
@@ -715,10 +775,12 @@ void loop() {
                 String stateStr = lastPowerStatus ? "on" : "off";
                 logInfo("Power state transition detected -> " + stateStr);
 
-                // **FAST PATH:** Send immediately without waiting for queue loop
+                // Persist first, then attempt immediate send. If send fails, it remains queued for retry.
+                enqueueEvent(stateStr, eventTime, currentPeak);
                 if (!transmitEventNow(stateStr, eventTime, currentPeak)) {
-                    logError("Immediate transmission failed. Enqueueing event for background retry.");
-                    enqueueEvent(stateStr, eventTime, currentPeak);
+                    logError("Immediate transmission failed. Event remains queued for background retry.");
+                } else {
+                    removeQueuedEvent(stateStr, eventTime, currentPeak);
                 }
             }
         }

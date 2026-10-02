@@ -45,8 +45,8 @@ const char* wifi_password      = "@Ajibandele612";
 const unsigned long WIFI_TIMEOUT_MS = 15000UL;
 
 // Static Node Metadata
-const char* FEEDER_NAME        = "Ijebu Ode";
-const char* TRANSFORMER_NAME   = "Radio DT";
+const char* FEEDER_NAME        = "Agungi";
+const char* TRANSFORMER_NAME   = "Bashir DT";
 const char* USER_LATITUDE      = "6.5230";
 const char* USER_LONGITUDE     = "3.3420";
 
