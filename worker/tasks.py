@@ -654,14 +654,16 @@ def send_power_email(
     volt_y: float = 0.0,
     stat_b=None,
     volt_b: float = 0.0,
+    event_id: str = None,
 ):
-    logger.info(f"Processing real-time power update for Feeder {feeder_name} | status={status} | dt={dt or 'std'}")
+    logger.info(f"Processing real-time power update for Feeder {feeder_name} | status={status} | dt={dt or 'std'} | event_id={event_id}")
     
     is_pearl = (str(dt).upper() == "PEARL")
 
     # 1. Database Persistence & State Change Detection
     feeder = None
     status_changed = True
+    saved_event_id = None
     try:
         from worker.main import save_power_status_update, PowerStatus
         
@@ -687,16 +689,18 @@ def send_power_email(
             transformer_code=transformer_name,
             sim_serial=sim_serial if sim_serial != "UNKNOWN" else (contact_phone or "UNKNOWN"),
             contact_phone=contact_phone,
-            msisdn=msisdn
+            msisdn=msisdn,
+            event_id=event_id,
         )
         
         # Save power status with phase data and check if status actually changed
-        feeder_id, status_changed = save_power_status_update(
+        feeder_id, status_changed, saved_event_id = save_power_status_update(
             data, server_time_dt,
             dt=dt,
             stat_r=stat_r, volt_r=volt_r,
             stat_y=stat_y, volt_y=volt_y,
             stat_b=stat_b, volt_b=volt_b,
+            event_id=event_id,
         )
         
         # Retrieve the updated Feeder details for reporting
@@ -712,9 +716,9 @@ def send_power_email(
         logger.error(f"Database persistence failed: {db_err}", exc_info=True)
         return
 
-    # If state did not transition, skip notifications (prevents telemetry packet spam/loops)
+    # Guardrail: If state did not transition, skip notifications and database update was skipped
     if not status_changed:
-        logger.info(f"Status for Feeder {feeder_name} unchanged ({status}). Telemetry logged to DB. Skipping alerts.")
+        logger.info(f"Status for Feeder {feeder_name} unchanged ({status}). Guardrail triggered: DB update skipped. Skipping alerts.")
         return
 
     # 2. Build the report body
@@ -775,13 +779,48 @@ def send_power_email(
     except Exception as e:
         logger.error(f"Failed to send email alert for Feeder {feeder_name}: {e}")
 
-    # 4. Send WhatsApp Alert
+    # 4. Send WhatsApp Alert with Atomic Deduplication
     try:
         phone_to_use = contact_phone or feeder.contact_phone or feeder.name or feeder_name
-        if phone_to_use:
-            send_whatsapp_power_message(phone_to_use, body, feeder_id=feeder.id)
-        else:
+        if not phone_to_use:
             logger.warning(f"No contact phone or feeder name available to send WhatsApp message for Feeder {feeder_name}")
+            return
+
+        should_send = True
+        # Check and lock status using SELECT ... FOR UPDATE to prevent duplicate sends across concurrent workers
+        if saved_event_id:
+            with engine.begin() as conn:
+                lock_query = text("""
+                    SELECT id, whatsapp_status 
+                    FROM myapp_powerstatus 
+                    WHERE event_id = :event_id 
+                    FOR UPDATE
+                """)
+                row = conn.execute(lock_query, {"event_id": str(saved_event_id)}).fetchone()
+                if row:
+                    curr_wp_status = (row[1] or "").lower()
+                    if curr_wp_status == "delivered":
+                        logger.info(f"WhatsApp alert already delivered for event_id {saved_event_id}. Skipping duplicate send.")
+                        should_send = False
+                    elif curr_wp_status != "undelivered":
+                        logger.info(f"WhatsApp status is '{curr_wp_status}' for event_id {saved_event_id}. Skipping send.")
+                        should_send = False
+                else:
+                    logger.warning(f"No PowerStatus record found for event_id {saved_event_id} during atomic lock check.")
+
+        if should_send:
+            wp_res = send_whatsapp_power_message(phone_to_use, body, feeder_id=feeder.id)
+            if wp_res is not None and saved_event_id:
+                with engine.begin() as conn:
+                    update_wp_query = text("""
+                        UPDATE myapp_powerstatus 
+                        SET whatsapp_status = 'delivered' 
+                        WHERE event_id = :event_id
+                    """)
+                    conn.execute(update_wp_query, {"event_id": str(saved_event_id)})
+                logger.info(f"Successfully updated whatsapp_status to 'delivered' for event_id {saved_event_id}")
+            elif wp_res is None:
+                logger.warning(f"WhatsApp dispatch returned None for event_id {saved_event_id}.")
     except Exception as exc:
         logger.error(f"Failed to send WhatsApp alert: {exc}", exc_info=True)
 @celery_app.task(name="myapp.tasks.send_daily_power_updates")

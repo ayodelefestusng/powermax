@@ -1,6 +1,7 @@
 from datetime import datetime, timezone, timedelta
 import logging
 from pathlib import Path
+import uuid
 from fastapi import FastAPI, HTTPException, Request, status, BackgroundTasks
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -80,6 +81,7 @@ class PowerStatus(BaseModel):
     sim_serial: Optional[str] = Field(default="UNKNOWN", alias="ccid")
     contact_phone: Optional[str] = None
     msisdn: str = "UNKNOWN"
+    event_id: Optional[str] = None
 
     model_config = ConfigDict(populate_by_name=True)          
 
@@ -121,24 +123,48 @@ async def power_update(request: Request):
         stat_b = payload.get("stat_b", None)
         volt_b = payload.get("volt_b", 0.0)
 
+        # 4. Handle timing metrics & timestamp adoption
+        server_time_dt = datetime.now(lagos_tz)
+        server_time = server_time_dt.strftime("%Y-%m-%d %H:%M:%S") + f".{int(server_time_dt.microsecond / 1000):03d}"
         
-        # Convert timestamp to human-readable date/time
-        human_timestamp = str(timestamp)
-        if timestamp:
-            try:
-                ts_val = float(timestamp)
-                if ts_val > 1e11:  # epoch in milliseconds
-                    ts_val /= 1000.0
-                if ts_val > 0:
-                    human_timestamp = datetime.fromtimestamp(ts_val, tz=lagos_tz).strftime("%Y-%m-%d %H:%M:%S")
-            except (ValueError, TypeError, OverflowError):
-                human_timestamp = str(timestamp)
+        use_server_time = False
+        adopted_time_dt = server_time_dt
+        try:
+            raw_ts = float(timestamp) if timestamp is not None else 0.0
+            if raw_ts <= 0:
+                use_server_time = True
+            else:
+                if raw_ts > 1e11:  # epoch in milliseconds
+                    raw_ts /= 1000.0
+                payload_time_dt = datetime.fromtimestamp(raw_ts, tz=lagos_tz)
+                drift_seconds = abs((server_time_dt - payload_time_dt).total_seconds())
+                if drift_seconds > 8 * 3600:
+                    use_server_time = True
+                    logger.warning(
+                        f"Timestamp drift ({drift_seconds/3600:.2f}h) exceeds 8-hour threshold. "
+                        f"Adopting server time instead of payload timestamp {timestamp}."
+                    )
+                else:
+                    adopted_time_dt = payload_time_dt
+        except (ValueError, TypeError, OverflowError, OSError) as ts_err:
+            logger.warning(f"Could not parse payload timestamp '{timestamp}': {ts_err}. Adopting server time.")
+            use_server_time = True
+
+        if use_server_time:
+            effective_timestamp = int(server_time_dt.timestamp())
+            human_timestamp = server_time_dt.strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            effective_timestamp = int(adopted_time_dt.timestamp())
+            human_timestamp = adopted_time_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+        # Generate unique event_id for this telemetry event (FastAPI generates it as hardware doesn't)
+        event_id = str(uuid.uuid4())
 
         now_str = datetime.now(lagos_tz).strftime("%Y-%m-%d %H:%M:%S")
 
         # Log the raw payload for deep visibility
         logger.info(f"Time Received {now_str} : PowerMonitor: Raw body received: {body_str}")
-        logger.info(f"Time Stamp {now_str} : PowerMonitor: Timestamp: {human_timestamp} (raw: {timestamp})")
+        logger.info(f"Time Stamp {now_str} : PowerMonitor: Adopted timestamp: {human_timestamp} (raw: {timestamp}, effective: {effective_timestamp}, event_id: {event_id})")
         if not status_val or peak_val is None or not feeder:
             logger.error(f"Ingest rejected - Missing critical keys. Payload: {payload}")
             return JSONResponse(
@@ -146,10 +172,6 @@ async def power_update(request: Request):
                 headers=headers,
                 content={"status": "rejected", "message": "Missing core tracking parameters"}
             )
-
-        # 4. Handle timing metrics
-        server_time_dt = datetime.now(lagos_tz)
-        server_time = server_time_dt.strftime("%Y-%m-%d %H:%M:%S") + f".{int(server_time_dt.microsecond / 1000):03d}"
         
         is_pearl = (dt_code.upper() == "PEARL")
         if is_pearl:
@@ -171,7 +193,7 @@ async def power_update(request: Request):
                 args=[
                     feeder, 
                     status_val, 
-                    timestamp, 
+                    effective_timestamp, 
                     server_time, 
                     contact_phone,
                     xfrmr,
@@ -185,16 +207,17 @@ async def power_update(request: Request):
                     float(volt_y),
                     stat_b,
                     float(volt_b),
+                    event_id,
                 ]
             )
-            logger.info("Grid status metric tracking update successfully offloaded to queue.")
+            logger.info(f"Grid status metric tracking update successfully offloaded to queue with event_id={event_id}.")
         except Exception as celery_err:
             logger.error(f"Could not send main task to Celery: {celery_err}")   
         
         return JSONResponse(
             status_code=status.HTTP_200_OK,
             headers=headers,
-            content={"status": "success", "queued_at": server_time, "node_validated": True}
+            content={"status": "success", "event_id": event_id, "queued_at": server_time, "node_validated": True}
         )
 
     except Exception as e:
@@ -208,7 +231,8 @@ def save_power_status_update(data: PowerStatus, server_time_dt,
                              dt: str = "",
                              stat_r=None, volt_r: float = 0.0,
                              stat_y=None, volt_y: float = 0.0,
-                             stat_b=None, volt_b: float = 0.0):
+                             stat_b=None, volt_b: float = 0.0,
+                             event_id: str = None):
     if not data.sim_serial:
         if data.contact_phone:
             data.sim_serial = data.contact_phone
@@ -332,22 +356,36 @@ def save_power_status_update(data: PowerStatus, server_time_dt,
                                 f"Cleaning up transient record {prev_record[0]} and suppressing alert."
                             )
                             conn.execute(text("DELETE FROM myapp_powerstatus WHERE id = :id"), {"id": prev_record[0]})
-                            return feeder_id, False
+                            return feeder_id, False, None
 
-            # Save power status — includes three-phase columns for PEARL DT
+            # Guardrail: If current status in DB is same as payload status, ignore and don't update DB
+            if not status_changed:
+                logger.info(
+                    f"Guardrail triggered: Status for Feeder {data.feeder_name} is unchanged ({new_status_str}). "
+                    f"Ignoring payload and skipping database insertion."
+                )
+                return feeder_id, False, None
+
+            # Resolve effective event_id
+            effective_event_id = str(event_id or data.event_id or uuid.uuid4())
+
+            # Save power status — includes event_id, whatsapp_status='undelivered', and phase columns for PEARL DT
             insert_status_query = text("""
                 INSERT INTO myapp_powerstatus (
+                    event_id, whatsapp_status,
                     feeder_id, status, timestamp, peak_a0, server_time,
                     sim_serial, msisdn,
                     dt, volt_r, stat_r, volt_y, stat_y, volt_b, stat_b
                 )
                 VALUES (
+                    :event_id, 'undelivered',
                     :feeder_id, :status, :timestamp, :peak_a0, :server_time,
                     :sim_serial, :msisdn,
                     :dt, :volt_r, :stat_r, :volt_y, :stat_y, :volt_b, :stat_b
                 )
             """)
             conn.execute(insert_status_query, {
+                "event_id": effective_event_id,
                 "feeder_id": feeder_id,
                 "status": data.status.upper(),
                 "timestamp": data.timestamp,
@@ -363,8 +401,8 @@ def save_power_status_update(data: PowerStatus, server_time_dt,
                 "volt_b": volt_b,
                 "stat_b": stat_b,
             })
-            logger.info(f"Persisted power status update in database for feeder {data.feeder_name} [dt={dt}, changed={status_changed}]")
-            return feeder_id, status_changed
+            logger.info(f"Persisted power status update in database for feeder {data.feeder_name} [event_id={effective_event_id}, dt={dt}, changed=True]")
+            return feeder_id, True, effective_event_id
     except Exception as e:
         logger.error(f"Error persisting power status update for feeder {data.feeder_name}: {e}", exc_info=True)
         raise e
@@ -686,7 +724,7 @@ async def create_attendance(data: AttendanceRequest):
 
 @app.get("/utility/")
 def read_root():
-    return {"message": "Hello from SIM 900 20082026v2 timestap RabbitMQ made default"}
+    return {"message": "Hello from SIM 900 20082026v2 timestap 05102026"}
 
 
 @app.api_route("/feeder_lookup", methods=["GET", "POST"])
