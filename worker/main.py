@@ -124,28 +124,75 @@ async def power_update(request: Request):
         volt_b = payload.get("volt_b", 0.0)
 
         # 4. Handle timing metrics & timestamp adoption
+        # server_time_dt = datetime.now(lagos_tz)
+        # server_time = server_time_dt.strftime("%Y-%m-%d %H:%M:%S") + f".{int(server_time_dt.microsecond / 1000):03d}"
+        
+        # use_server_time = False
+        # adopted_time_dt = server_time_dt
+        # try:
+        #     raw_ts = float(timestamp) if timestamp is not None else 0.0
+        #     if raw_ts <= 0:
+        #         use_server_time = True
+        #     else:
+        #         if raw_ts > 1e11:  # epoch in milliseconds
+        #             raw_ts /= 1000.0
+        #         payload_time_dt = datetime.fromtimestamp(raw_ts, tz=lagos_tz)
+        #         drift_seconds = abs((server_time_dt - payload_time_dt).total_seconds())
+        #         if drift_seconds > 8 * 3600:
+        #             use_server_time = True
+        #             logger.warning(
+        #                 f"Timestamp drift ({drift_seconds/3600:.2f}h) exceeds 8-hour threshold. "
+        #                 f"Adopting server time instead of payload timestamp {timestamp}."
+        #             )
+        #         else:
+        #             adopted_time_dt = payload_time_dt
+        # except (ValueError, TypeError, OverflowError, OSError) as ts_err:
+        #     logger.warning(f"Could not parse payload timestamp '{timestamp}': {ts_err}. Adopting server time.")
+        #     use_server_time = True
+
+        # if use_server_time:
+        #     effective_timestamp = int(server_time_dt.timestamp())
+        #     human_timestamp = server_time_dt.strftime("%Y-%m-%d %H:%M:%S")
+        # else:
+        #     effective_timestamp = int(adopted_time_dt.timestamp())
+        #     human_timestamp = adopted_time_dt.strftime("%Y-%m-%d %H:%M:%S")
+        
+        
+        # 4. Handle timing metrics & timestamp adoption
         server_time_dt = datetime.now(lagos_tz)
         server_time = server_time_dt.strftime("%Y-%m-%d %H:%M:%S") + f".{int(server_time_dt.microsecond / 1000):03d}"
-        
+
         use_server_time = False
         adopted_time_dt = server_time_dt
+
         try:
             raw_ts = float(timestamp) if timestamp is not None else 0.0
             if raw_ts <= 0:
+                # MCU sent 0 → fallback
                 use_server_time = True
+                logger.warning("MCU timestamp is 0. Falling back to server time.")
             else:
-                if raw_ts > 1e11:  # epoch in milliseconds
+                # Normalize if epoch is in milliseconds
+                if raw_ts > 1e11:
                     raw_ts /= 1000.0
+
                 payload_time_dt = datetime.fromtimestamp(raw_ts, tz=lagos_tz)
                 drift_seconds = abs((server_time_dt - payload_time_dt).total_seconds())
-                if drift_seconds > 8 * 3600:
+
+                logger.info(
+                    f"RTC timestamp {payload_time_dt}, Server time {server_time_dt}, Drift {drift_seconds:.1f}s"
+                )
+
+                # Drift guardrail: allow up to 24 hours difference
+                if drift_seconds > 24 * 3600:
                     use_server_time = True
                     logger.warning(
-                        f"Timestamp drift ({drift_seconds/3600:.2f}h) exceeds 8-hour threshold. "
+                        f"Timestamp drift ({drift_seconds/3600:.2f}h) exceeds 24-hour threshold. "
                         f"Adopting server time instead of payload timestamp {timestamp}."
                     )
                 else:
                     adopted_time_dt = payload_time_dt
+
         except (ValueError, TypeError, OverflowError, OSError) as ts_err:
             logger.warning(f"Could not parse payload timestamp '{timestamp}': {ts_err}. Adopting server time.")
             use_server_time = True
@@ -157,6 +204,8 @@ async def power_update(request: Request):
             effective_timestamp = int(adopted_time_dt.timestamp())
             human_timestamp = adopted_time_dt.strftime("%Y-%m-%d %H:%M:%S")
 
+        
+        
         # Generate unique event_id for this telemetry event (FastAPI generates it as hardware doesn't)
         event_id = str(uuid.uuid4())
 
@@ -724,7 +773,7 @@ async def create_attendance(data: AttendanceRequest):
 
 @app.get("/utility/")
 def read_root():
-    return {"message": "Hello from SIM 900 20082026v2 timestap 05102026"}
+    return {"message": "Hello from SIM 900 20082026v2 timestap 15102026"}
 
 
 @app.api_route("/feeder_lookup", methods=["GET", "POST"])
