@@ -1010,3 +1010,99 @@ async def feeder_lookup(
         )
 
 
+from fastapi.responses import FileResponse
+from worker.weekly_dashboard import generate_weekly_power_infographic
+from worker.tasks import send_whatsapp_power_media
+
+class SendWeeklyInfographicRequest(BaseModel):
+    feeder_id: int
+    recipient: Optional[str] = None
+    target_sunday: Optional[str] = None
+
+@app.get("/power-tracker/weekly-infographic/{feeder_id}")
+async def get_weekly_infographic(feeder_id: int, target_sunday: Optional[str] = None):
+    """
+    Generate weekly infographic metrics, summary, and JPG snapshot for a feeder.
+    """
+    try:
+        t_sun = None
+        if target_sunday:
+            t_sun = datetime.strptime(target_sunday, "%Y-%m-%d").date()
+        summary, img_file, metrics = generate_weekly_power_infographic(feeder_id=feeder_id, target_sunday=t_sun)
+        return {
+            "status": "success",
+            "feeder_id": feeder_id,
+            "image_file": img_file,
+            "text_summary": summary,
+            "metrics": metrics
+        }
+    except Exception as e:
+        logger.error(f"Error generating weekly infographic for feeder {feeder_id}: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"status": "error", "message": str(e)}
+        )
+
+@app.get("/power-tracker/weekly-infographic-image/{feeder_id}")
+async def get_weekly_infographic_image(feeder_id: int, target_sunday: Optional[str] = None):
+    """
+    Return the generated weekly infographic image directly as JPEG.
+    """
+    try:
+        t_sun = None
+        if target_sunday:
+            t_sun = datetime.strptime(target_sunday, "%Y-%m-%d").date()
+        summary, img_file, metrics = generate_weekly_power_infographic(feeder_id=feeder_id, target_sunday=t_sun)
+        return FileResponse(img_file, media_type="image/jpeg", filename=os.path.basename(img_file))
+    except Exception as e:
+        logger.error(f"Error serving weekly infographic image: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"status": "error", "message": str(e)}
+        )
+
+@app.post("/power-tracker/send-weekly-infographic/")
+async def send_weekly_infographic_endpoint(payload: SendWeeklyInfographicRequest, background_tasks: BackgroundTasks):
+    """
+    Generate and send weekly infographic to WhatsApp.
+    If recipient is given, sends to that number.
+    Otherwise sends to Feeder.whatsapp_primary and Feeder.whatsapp_group.
+    """
+    try:
+        t_sun = None
+        if payload.target_sunday:
+            t_sun = datetime.strptime(payload.target_sunday, "%Y-%m-%d").date()
+            
+        summary, img_file, metrics = generate_weekly_power_infographic(
+            feeder_id=payload.feeder_id,
+            target_sunday=t_sun
+        )
+        
+        override = [payload.recipient] if payload.recipient else None
+        
+        # Dispatch WhatsApp in background task
+        background_tasks.add_task(
+            send_whatsapp_power_media,
+            image_path=img_file,
+            caption=summary,
+            number=payload.recipient,
+            feeder_id=payload.feeder_id,
+            recipients_override=override
+        )
+        
+        return {
+            "status": "queued",
+            "message": "Weekly infographic generated and queued for WhatsApp dispatch.",
+            "feeder_id": payload.feeder_id,
+            "target_recipient": payload.recipient or "Feeder configured recipients",
+            "image_file": img_file,
+            "text_summary": summary
+        }
+    except Exception as e:
+        logger.error(f"Error dispatching weekly infographic: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"status": "error", "message": str(e)}
+        )
+
+

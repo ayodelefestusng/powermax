@@ -115,5 +115,9 @@ celery_app.conf.beat_schedule = {
     "daily-power-summary": {
         "task": "myapp.tasks.send_daily_power_updates",
         "schedule": crontab(minute="1", hour="0"),  # Runs daily at 00:01 Lagos time
-    }
+    },
+    "weekly-power-infographic": {
+        "task": "myapp.tasks.send_weekly_power_infographics",
+        "schedule": crontab(minute="0", hour="12", day_of_week="sun"),  # Every Sunday at 12:00 noon Lagos time
+    },
 }

@@ -259,6 +259,100 @@ def send_whatsapp_power_message(number: str, message_body: str, feeder_id=None, 
             
     return last_response
 
+
+def send_whatsapp_power_media(
+    image_path: str,
+    caption: str = "",
+    number: str = None,
+    feeder_id=None,
+    feeder_name=None,
+    recipients_override=None
+):
+    """
+    Send an image/infographic message via Evolution API (/message/sendMedia/{POWER_INSTANCE}).
+    Recipients are resolved from the feeder's whatsapp_primary and whatsapp_group fields,
+    or from recipients_override if provided.
+    """
+    import base64
+    base_url = EVOLUTION_API_URL.rstrip('/')
+    url = f"{base_url}/message/sendMedia/{POWER_INSTANCE}"
+    headers = {
+        "apikey": EVOLUTION_API_KEY,
+        "Content-Type": "application/json"
+    }
+
+    if not os.path.exists(image_path):
+        logger.error(f"Image path does not exist: {image_path}")
+        return None
+
+    with open(image_path, "rb") as f:
+        b64_data = base64.b64encode(f.read()).decode("utf-8")
+
+    recipients = []
+    if recipients_override:
+        for r in recipients_override:
+            recipients.extend(clean_and_format_whatsapp_recipients(r))
+    elif feeder_id is not None or feeder_name:
+        try:
+            with engine.connect() as conn:
+                if feeder_id is not None:
+                    row = conn.execute(
+                        text("""SELECT whatsapp_primary, whatsapp_group, primary_recipient
+                                 FROM myapp_feeder WHERE id = :feeder_id"""),
+                        {"feeder_id": feeder_id}
+                    ).fetchone()
+                else:
+                    row = conn.execute(
+                        text("""SELECT whatsapp_primary, whatsapp_group, primary_recipient
+                                 FROM myapp_feeder
+                                 WHERE LOWER(TRIM(name)) = LOWER(TRIM(:feeder_name))
+                                 LIMIT 1"""),
+                        {"feeder_name": feeder_name}
+                    ).fetchone()
+                if row:
+                    wp_primary, wp_group, legacy_recipients = row
+                    recipients = clean_and_format_whatsapp_recipients(wp_primary, wp_group)
+                    if not recipients and legacy_recipients:
+                        recipients = clean_and_format_whatsapp_recipients(legacy_recipients)
+            logger.info(f"WhatsApp media recipients for feeder {feeder_id or feeder_name}: {recipients}")
+        except Exception as db_err:
+            logger.error(f"Failed to lookup WhatsApp media recipients for feeder {feeder_id or feeder_name}: {db_err}")
+
+    if not recipients and number:
+        clean_num = str(number).strip()
+        recipients = clean_and_format_whatsapp_recipients(clean_num)
+
+    if not recipients:
+        default_primaries = "2348021299221, 2349068770054"
+        default_groups = "120363410539285836@g.us, 120363429032532411@g.us, 120363429460546485@g.us"
+        recipients = clean_and_format_whatsapp_recipients(default_primaries, default_groups)
+
+    filename = os.path.basename(image_path)
+    last_response = None
+    for recipient in recipients:
+        logger.info(f"Sending WhatsApp infographic to {recipient}")
+        payload = {
+            "number": recipient,
+            "mediatype": "image",
+            "media": b64_data,
+            "caption": caption,
+            "fileName": filename
+        }
+        try:
+            response = requests.post(url, json=payload, headers=headers, timeout=30)
+            logger.info(f"WhatsApp infographic sent to {recipient}. Status code: {response.status_code}")
+            if response.status_code in [200, 201]:
+                resp_json = response.json()
+                if last_response is None:
+                    last_response = resp_json
+            else:
+                logger.error(f"Evolution API Error ({response.status_code}) for {recipient}: {response.text}")
+        except Exception as e:
+            logger.error(f"Failed to send WhatsApp infographic to {recipient}: {e}", exc_info=True)
+
+    return last_response
+
+
 def generate_power_report(feeder, target_date, is_today=True):
     """
     Query power status updates and reconstruct the power cycles on the target date.
@@ -960,5 +1054,83 @@ def get_broker_info():
         "broker_type": BROKER_TYPE,
         "broker": masked_broker,
         "backend": masked_backend,
+    }
+
+
+@celery_app.task(name="myapp.tasks.send_weekly_power_infographics")
+def send_weekly_power_infographics():
+    """
+    Celery Beat periodic task: Runs every Sunday at 12:00 noon (Lagos time).
+    Iterates through all feeders in the database, generates the weekly infographic
+    and WhatsApp text summary, and dispatches the media to the feeder's
+    whatsapp_primary and whatsapp_group.
+    """
+    logger.info("Executing scheduled weekly power infographics broadcast...")
+    feeders = []
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("SELECT id, name, band, whatsapp_primary, whatsapp_group FROM myapp_feeder ORDER BY id")).fetchall()
+            for r in rows:
+                feeders.append({"id": r[0], "name": r[1], "band": r[2], "whatsapp_primary": r[3], "whatsapp_group": r[4]})
+    except Exception as e:
+        logger.error(f"Error fetching feeders for weekly infographic: {e}", exc_info=True)
+        return []
+
+    from worker.weekly_dashboard import generate_weekly_power_infographic
+
+    results = []
+    for f in feeders:
+        f_id = f["id"]
+        f_name = f["name"]
+        try:
+            logger.info(f"Generating weekly infographic for Feeder {f_id} ({f_name})...")
+            summary, img_file, metrics = generate_weekly_power_infographic(feeder_id=f_id)
+            resp = send_whatsapp_power_media(
+                image_path=img_file,
+                caption=summary,
+                feeder_id=f_id,
+                feeder_name=f_name
+            )
+            results.append({"feeder_id": f_id, "feeder_name": f_name, "status": "sent" if resp else "dispatched"})
+        except Exception as exc:
+            logger.error(f"Failed to process weekly infographic for Feeder {f_id} ({f_name}): {exc}", exc_info=True)
+            results.append({"feeder_id": f_id, "feeder_name": f_name, "status": "error", "error": str(exc)})
+
+    logger.info(f"Weekly power infographics broadcast finished. Results: {results}")
+    return results
+
+
+@celery_app.task(name="myapp.tasks.send_feeder_weekly_infographic")
+def send_feeder_weekly_infographic(feeder_id: int, recipient: str = None, target_sunday_str: str = None):
+    """
+    Ad-hoc / targeted Celery task to generate and send a weekly infographic for a specific feeder.
+    Can send to a specific recipient phone or to the feeder's configured WhatsApp groups.
+    target_sunday_str format: 'YYYY-MM-DD' (optional).
+    """
+    from worker.weekly_dashboard import generate_weekly_power_infographic
+    from datetime import datetime
+    
+    target_sunday = None
+    if target_sunday_str:
+        target_sunday = datetime.strptime(target_sunday_str, "%Y-%m-%d").date()
+        
+    logger.info(f"Generating weekly infographic for Feeder {feeder_id} (target_sunday={target_sunday})...")
+    summary, img_file, metrics = generate_weekly_power_infographic(feeder_id=feeder_id, target_sunday=target_sunday)
+    
+    recipients_override = [recipient] if recipient else None
+    resp = send_whatsapp_power_media(
+        image_path=img_file,
+        caption=summary,
+        number=recipient,
+        feeder_id=feeder_id,
+        recipients_override=recipients_override
+    )
+    return {
+        "status": "success" if resp else "dispatched",
+        "feeder_id": feeder_id,
+        "recipient": recipient,
+        "image_file": img_file,
+        "summary": summary,
+        "metrics": metrics
     }
 

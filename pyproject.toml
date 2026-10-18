@@ -15,4 +15,6 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "pytz>=2024.1",
     "requests>=2.32.0",
+    "matplotlib>=3.9.0",
+    "pillow>=10.0.0",
 ]
