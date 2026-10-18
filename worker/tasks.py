@@ -338,17 +338,22 @@ def send_whatsapp_power_media(
             "caption": caption,
             "fileName": filename
         }
-        try:
-            response = requests.post(url, json=payload, headers=headers, timeout=30)
-            logger.info(f"WhatsApp infographic sent to {recipient}. Status code: {response.status_code}")
-            if response.status_code in [200, 201]:
-                resp_json = response.json()
-                if last_response is None:
-                    last_response = resp_json
-            else:
-                logger.error(f"Evolution API Error ({response.status_code}) for {recipient}: {response.text}")
-        except Exception as e:
-            logger.error(f"Failed to send WhatsApp infographic to {recipient}: {e}", exc_info=True)
+        for attempt in range(2):
+            try:
+                response = requests.post(url, json=payload, headers=headers, timeout=60)
+                logger.info(f"WhatsApp infographic sent to {recipient} (attempt {attempt+1}). Status code: {response.status_code}")
+                if response.status_code in [200, 201]:
+                    resp_json = response.json()
+                    if last_response is None:
+                        last_response = resp_json
+                    break
+                else:
+                    logger.error(f"Evolution API Error ({response.status_code}) for {recipient}: {response.text}")
+            except Exception as e:
+                logger.error(f"Failed to send WhatsApp infographic to {recipient} on attempt {attempt+1}: {e}")
+                if attempt == 0:
+                    import time
+                    time.sleep(2)
 
     return last_response
 

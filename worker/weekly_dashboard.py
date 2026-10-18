@@ -9,7 +9,7 @@ from typing import Tuple, Dict, Any, Optional
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from matplotlib.patches import FancyBboxPatch
+from matplotlib.patches import FancyBboxPatch, Rectangle
 import matplotlib.ticker as ticker
 import numpy as np
 from PIL import Image
@@ -20,6 +20,15 @@ from worker.db import engine
 logger = logging.getLogger(__name__)
 LAGOS_TZ = pytz.timezone("Africa/Lagos")
 
+BAND_MIN_HOURS = {
+    'A': 20.0,
+    'B': 16.0,
+    'C': 12.0,
+    'D': 8.0,
+    'E': 4.0,
+    'F': 0.0
+}
+
 def to_lagos(dt: Optional[datetime]) -> Optional[datetime]:
     """Ensure datetime is timezone-aware in Africa/Lagos timezone."""
     if dt is None:
@@ -29,7 +38,7 @@ def to_lagos(dt: Optional[datetime]) -> Optional[datetime]:
     return dt.astimezone(LAGOS_TZ)
 
 def format_duration_days_hours(seconds: float) -> str:
-    """Format seconds into readable days and hours (e.g., '1d 18h' or '5h 30m')."""
+    """Format seconds into readable days and hours (e.g., '1d 18h' or '0d 6h')."""
     total_seconds = max(0, int(seconds))
     hours = total_seconds // 3600
     minutes = (total_seconds % 3600) // 60
@@ -39,13 +48,18 @@ def format_duration_days_hours(seconds: float) -> str:
     if days > 0:
         if rem_hours > 0:
             return f"{days}d {rem_hours}h"
-        return f"{days}d"
+        return f"{days}d 0h"
     elif hours > 0:
-        if minutes > 0:
-            return f"{hours}h {minutes}m"
-        return f"{hours}h"
+        return f"0d {hours}h"
     else:
-        return f"{minutes}m"
+        return f"0d 0h"
+
+def format_duration_hours_mins(seconds: float) -> str:
+    """Format seconds into readable hours and minutes (e.g., '6 hrs 12 mins')."""
+    total_seconds = max(0, int(seconds))
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    return f"{hours} hrs {minutes} mins"
 
 def compute_interval_metrics(events_window: list, state_at_start: str, start_dt: datetime, end_dt: datetime) -> Dict[str, Any]:
     """
@@ -102,7 +116,6 @@ def get_weekly_metrics(feeder_id: int, target_sunday: Optional[date] = None) -> 
     now = datetime.now(LAGOS_TZ)
     if target_sunday is None:
         # Determine the most recently completed Saturday
-        # weekday(): Monday is 0, Sunday is 6, Saturday is 5
         days_since_sat = (now.weekday() - 5) % 7
         if days_since_sat == 0:
             days_since_sat = 7  # If today is Saturday, report the previous completed week
@@ -188,7 +201,8 @@ def get_weekly_metrics(feeder_id: int, target_sunday: Optional[date] = None) -> 
     # Daily Breakdown (Sunday to Saturday)
     daily_stats = []
     days_100_pct = 0
-    best_day = None
+    best_day_name = None
+    best_day_sec = 0.0
     best_day_pct = -1.0
 
     for i in range(7):
@@ -200,18 +214,22 @@ def get_weekly_metrics(feeder_id: int, target_sunday: Optional[date] = None) -> 
         d_res = compute_interval_metrics(d_events, d_state, d_start, d_end)
         
         pct = d_res['uptime_pct']
+        up_sec = d_res['uptime_sec']
         if pct >= 99.5:
             days_100_pct += 1
         if pct > best_day_pct:
             best_day_pct = pct
-            best_day = (d_date.strftime("%a"), pct)
+            best_day_sec = up_sec
+            best_day_name = d_date.strftime("%a")
             
         daily_stats.append({
             "day": d_date.strftime("%a"),
             "date": d_date.strftime("%d/%m"),
-            "full_date": d_date.strftime("%Y-%m-%d"),
+            "full_date": d_date.strftime("%a %b %d, %Y"),  # e.g. Mon Aug 01, 2012 format
+            "avail": format_duration_hours_mins(up_sec),
+            "pct": round(pct, 1),
             "uptime_pct": round(pct, 1),
-            "uptime_hours": round(d_res['uptime_sec'] / 3600.0, 1),
+            "uptime_hours": round(up_sec / 3600.0, 1),
             "downtime_hours": round(d_res['downtime_sec'] / 3600.0, 1),
             "outages": d_res['outages']
         })
@@ -220,6 +238,16 @@ def get_weekly_metrics(feeder_id: int, target_sunday: Optional[date] = None) -> 
     wow_uptime_diff = round(cw_metrics['uptime_pct'] - lw_metrics['uptime_pct'], 1)
     wow_downtime_diff_hours = round((cw_metrics['downtime_sec'] - lw_metrics['downtime_sec']) / 3600.0, 1)
     wow_outages_diff = cw_metrics['outages'] - lw_metrics['outages']
+
+    # Top Supply Day with Duration (Days hrs)
+    top_day_duration_str = format_duration_days_hours(best_day_sec)
+    top_day_formatted = f"{best_day_name} ({top_day_duration_str} • {best_day_pct:.1f}%)" if best_day_name else "N/A"
+
+    # Grid Target Calculation
+    band_code = str(feeder_info['band']).strip().upper().replace("BAND", "").strip() or 'D'
+    min_required_hours = BAND_MIN_HOURS.get(band_code, 8.0)
+    avg_daily_hours = (cw_metrics['uptime_sec'] / 7.0) / 3600.0
+    grid_target_met = avg_daily_hours >= min_required_hours
 
     return {
         "feeder": feeder_info,
@@ -246,10 +274,10 @@ def get_weekly_metrics(feeder_id: int, target_sunday: Optional[date] = None) -> 
         "wow_comparison": {
             "uptime_diff_pct": wow_uptime_diff,
             "uptime_improved": wow_uptime_diff >= 0,
-            "uptime_change_str": f"▲ Up from {lw_metrics['uptime_pct']:.1f}%" if wow_uptime_diff >= 0 else f"▼ Down from {lw_metrics['uptime_pct']:.1f}%",
+            "uptime_change_str": f"▲ Up from {lw_metrics['uptime_pct']:.1f}% last week" if wow_uptime_diff >= 0 else f"▼ Down from {lw_metrics['uptime_pct']:.1f}% last week",
             "downtime_diff_hours": wow_downtime_diff_hours,
             "downtime_improved": wow_downtime_diff_hours <= 0,
-            "downtime_change_str": f"▼ Down from {format_duration_days_hours(lw_metrics['downtime_sec'])}" if wow_downtime_diff_hours <= 0 else f"▲ Up from {format_duration_days_hours(lw_metrics['downtime_sec'])}",
+            "downtime_change_str": f"▼ Down from {format_duration_days_hours(lw_metrics['downtime_sec'])} last week" if wow_downtime_diff_hours <= 0 else f"▲ Up from {format_duration_days_hours(lw_metrics['downtime_sec'])} last week",
             "outages_diff": wow_outages_diff,
             "outages_improved": wow_outages_diff <= 0,
             "outages_change_str": f"▼ Down from {lw_metrics['outages']} incidents" if wow_outages_diff <= 0 else f"▲ Up from {lw_metrics['outages']} incidents",
@@ -258,24 +286,34 @@ def get_weekly_metrics(feeder_id: int, target_sunday: Optional[date] = None) -> 
             "uptime_pct": round(mtd_metrics['uptime_pct'], 1),
             "days_with_100_pct": days_100_pct
         },
+        "grid_target": {
+            "band": band_code,
+            "min_required_hours": min_required_hours,
+            "avg_daily_hours": round(avg_daily_hours, 1),
+            "is_met": grid_target_met,
+            "status_text": "Minimum Met" if grid_target_met else "Minimum Not Met"
+        },
         "daily_breakdown": daily_stats,
-        "best_day": best_day or ("N/A", 0.0)
+        "top_day_str": top_day_formatted
     }
 
 def generate_whatsapp_summary(metrics: Dict[str, Any]) -> str:
     """
-    Format WhatsApp-friendly text summary with emojis and structured markdown.
+    Format WhatsApp-friendly text summary with emojis, table breakdown, and structured markdown.
     """
     feeder = metrics["feeder"]
     cw = metrics["current_week"]
-    lw = metrics["last_week"]
     wow = metrics["wow_comparison"]
     mtd = metrics["mtd"]
+    gt = metrics["grid_target"]
     week_disp = metrics["week_range"]["display"]
     
     # Emojis and indicators
     up_icon = "🟢" if wow["uptime_improved"] else "🔴"
+    down_icon = "🟢" if wow["downtime_improved"] else "🔴"
+    outage_icon = "🟢" if wow["outages_improved"] else "🔴"
     wow_sign = "+" if wow["uptime_diff_pct"] >= 0 else ""
+    target_emoji = "✅" if gt["is_met"] else "❌"
     
     lines = [
         "📊 *WEEKLY POWER REPORT SNAPSHOT*",
@@ -288,202 +326,217 @@ def generate_whatsapp_summary(metrics: Dict[str, Any]) -> str:
         f"   └ {wow['uptime_change_str']} ({wow_sign}{wow['uptime_diff_pct']}%) {up_icon}",
         "",
         f"⏱️ *Total Downtime:* {cw['downtime_duration']}",
-        f"   └ {wow['downtime_change_str']}",
+        f"   └ {wow['downtime_change_str']} {down_icon}",
         "",
         f"🔌 *Power Outages:* {cw['outages']} incidents",
-        f"   └ {wow['outages_change_str']}",
+        f"   └ {wow['outages_change_str']} {outage_icon}",
         "",
-        "📊 *Daily Uptime Performance:*",
+        f"🎯 *Grid Target:* {target_emoji} *{gt['status_text']}* (Band {gt['band']}: {gt['min_required_hours']}h/day req.)",
+        f"🏆 *Top Supply Day:* {metrics['top_day_str']}",
+        "",
+        "📋 *Daily Performance Table:*",
+        "```",
+        f"{'Date':<17} | {'Availability':<12} | {'% Uptime':<8} | {'Outages':<7}",
+        "-" * 50,
     ]
     
-    # Daily breakdown formatting in compact grid
-    daily_items = metrics["daily_breakdown"]
-    row1 = " • ".join([f"*{d['day']}:* {d['uptime_pct']}%" for d in daily_items[:4]])
-    row2 = " • ".join([f"*{d['day']}:* {d['uptime_pct']}%" for d in daily_items[4:]])
-    lines.append(f" {row1}")
-    lines.append(f" {row2}")
-    lines.append("")
-    
-    lines.append(f"📈 *Month-to-Date Avg:* {mtd['uptime_pct']}%")
-    lines.append(f"🔄 *Week-on-Week Trend:* {wow_sign}{wow['uptime_diff_pct']}% {up_icon}")
-    if mtd['days_with_100_pct'] > 0:
-        lines.append(f"🏆 *100% Uptime Days:* {mtd['days_with_100_pct']} day{'s' if mtd['days_with_100_pct'] > 1 else ''}")
+    for d in metrics["daily_breakdown"]:
+        lines.append(f"{d['full_date']:<17} | {d['avail']:<12} | {d['pct']:>6.1f}% | {d['outages']:^7}")
         
-    lines.append("━━━━━━━━━━━━━━━━━━━━━━━")
-    lines.append("_Generated automatically by Power Tracker Intelligence_")
+    lines.extend([
+        "```",
+        "",
+        f"📈 *Month-to-Date Avg:* {mtd['uptime_pct']}%",
+        f"🔄 *Week-on-Week Trend:* {wow_sign}{wow['uptime_diff_pct']}% {up_icon}",
+        "━━━━━━━━━━━━━━━━━━━━━━━",
+        "_Generated automatically by Power Tracker Intelligence_"
+    ])
     
     return "\n".join(lines)
 
 def generate_infographic_image(metrics: Dict[str, Any], output_path: str) -> str:
     """
     Generate a world-class infographic chart snapshot using Matplotlib,
-    matching the attached visual design guide and exported as a lightweight JPG.
+    featuring a clean white background, headline KPI cards, 7-day daily bar chart,
+    tabular breakdown, and red-font Minimum Not Met grid target status.
+    Exported as an ultra-compact JPEG (~85-95 KB).
     """
     feeder = metrics["feeder"]
     cw = metrics["current_week"]
     wow = metrics["wow_comparison"]
     mtd = metrics["mtd"]
+    gt = metrics["grid_target"]
     daily_stats = metrics["daily_breakdown"]
     date_range_str = metrics["week_range"]["display"]
     
-    # Use 800 x 1180 px layout at 100 DPI
-    fig_w, fig_h = 8.0, 11.8
+    # Dimensions: 8.2 x 14.2 inches at 100 DPI -> 820 x 1420 px
+    fig_w, fig_h = 8.2, 14.2
     fig = plt.figure(figsize=(fig_w, fig_h), dpi=100)
-    fig.patch.set_facecolor('#0d3822')
+    fig.patch.set_facecolor('#f8fafc')
     
     ax = fig.add_axes([0, 0, 1, 1])
-    ax.set_facecolor('#0d3822')
+    ax.set_facecolor('#f8fafc')
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1)
     ax.axis('off')
     
-    # Outer frame container
-    outer_card = FancyBboxPatch(
-        (0.04, 0.03), 0.92, 0.94,
-        boxstyle="round,pad=0.01,rounding_size=0.03",
-        facecolor='#10452b', edgecolor='#1a5e3b',
+    # Outer main white card
+    card_margin_x = 0.035
+    card_margin_y = 0.02
+    card_w = 1.0 - 2 * card_margin_x
+    card_h = 1.0 - 2 * card_margin_y
+    
+    main_card = FancyBboxPatch(
+        (card_margin_x, card_margin_y), card_w, card_h,
+        boxstyle="round,pad=0.008,rounding_size=0.025",
+        facecolor='#ffffff', edgecolor='#e2e8f0',
         linewidth=1.5, zorder=1
     )
-    ax.add_patch(outer_card)
-
+    ax.add_patch(main_card)
+    
     # 1. Header Section
     ax.text(
-        0.5, 0.938, "⚡ Weekly Power Report Snapshot",
+        0.5, 0.962, "⚡ Weekly Power Report Snapshot",
         ha='center', va='center',
-        fontsize=18, fontweight='bold', color='#ffffff',
+        fontsize=18, fontweight='bold', color='#0f172a',
         zorder=3
     )
     
-    # Feeder Name & Band Badge
-    badge_w = min(0.70, max(0.45, len(feeder['name']) * 0.02 + 0.20))
+    # Feeder & Band Badge
+    band_clean = str(feeder['band']).replace('Band', '').strip()
+    feeder_badge_text = f"{feeder['name']}  •  Band {band_clean}"
+    badge_w = min(0.68, max(0.42, len(feeder_badge_text) * 0.018 + 0.18))
     badge_x = (1.0 - badge_w) / 2.0
     badge_box = FancyBboxPatch(
-        (badge_x, 0.888), badge_w, 0.032,
-        boxstyle="round,pad=0.005,rounding_size=0.015",
-        facecolor='#0b2b1a', edgecolor='#22c55e',
-        linewidth=1.0, zorder=2
+        (badge_x, 0.925), badge_w, 0.026,
+        boxstyle="round,pad=0.004,rounding_size=0.012",
+        facecolor='#f0fdf4', edgecolor='#86efac',
+        linewidth=1.2, zorder=2
     )
     ax.add_patch(badge_box)
-    
     ax.text(
-        0.5, 0.904, f"{feeder['name']}  •  Band {feeder['band']}",
+        0.5, 0.938, feeder_badge_text,
         ha='center', va='center',
-        fontsize=11.5, fontweight='bold', color='#4ade80',
+        fontsize=11, fontweight='bold', color='#15803d',
         zorder=3
     )
     
+    # Date Subtitle
     ax.text(
-        0.5, 0.866, f"{date_range_str}",
+        0.5, 0.902, f"{date_range_str}",
         ha='center', va='center',
-        fontsize=11, fontweight='normal', color='#cbd5e1',
+        fontsize=11, fontweight='bold', color='#64748b',
         zorder=3
     )
+    
+    # Subtle separator
+    ax.plot([0.08, 0.92], [0.884, 0.884], color='#f1f5f9', lw=1.5, zorder=2)
 
     # 2. Three Metric Cards (Uptime, Downtime, Outages)
-    card_y = 0.675
-    card_h = 0.165
-    card_w = 0.28
-    gap = 0.025
+    card_y = 0.738
+    card_h = 0.134
+    metric_w = 0.275
+    gap = 0.022
     start_x = 0.065
     
     cards_data = [
         {
             "x": start_x,
-            "title": "⚡ Uptime",
+            "title": "⚡ Uptime:",
             "val": f"{cw['uptime_pct']:.1f}%",
+            "val_color": '#15803d',
             "sub": cw['uptime_duration'],
             "badge": wow['uptime_change_str'],
-            "badge_color": '#15803d' if wow['uptime_improved'] else '#b91c1c',
-            "accent": '#4ade80'
+            "badge_bg": '#16a34a' if wow['uptime_improved'] else '#dc2626',
         },
         {
-            "x": start_x + card_w + gap,
-            "title": "Downtime",
+            "x": start_x + metric_w + gap,
+            "title": "Downtime:",
             "val": cw['downtime_duration'],
+            "val_color": '#1e3a8a',
             "sub": f"{100 - cw['uptime_pct']:.1f}% off-grid",
             "badge": wow['downtime_change_str'],
-            "badge_color": '#15803d' if wow['downtime_improved'] else '#b91c1c',
-            "accent": '#fbbf24'
+            "badge_bg": '#16a34a' if wow['downtime_improved'] else '#dc2626',
         },
         {
-            "x": start_x + 2 * (card_w + gap),
-            "title": "Outages",
-            "val": f"{cw['outages']}",
-            "sub": "incidents",
+            "x": start_x + 2 * (metric_w + gap),
+            "title": "Outages:",
+            "val": f"{cw['outages']} incidents",
+            "val_color": '#b91c1c',
+            "sub": "total power cuts",
             "badge": wow['outages_change_str'],
-            "badge_color": '#15803d' if wow['outages_improved'] else '#b91c1c',
-            "accent": '#f87171'
+            "badge_bg": '#16a34a' if wow['outages_improved'] else '#dc2626',
         }
     ]
 
     for c in cards_data:
         c_box = FancyBboxPatch(
-            (c["x"], card_y), card_w, card_h,
-            boxstyle="round,pad=0.008,rounding_size=0.02",
-            facecolor='#0b2e1d', edgecolor='#1d6e43',
+            (c["x"], card_y), metric_w, card_h,
+            boxstyle="round,pad=0.006,rounding_size=0.018",
+            facecolor='#ffffff', edgecolor='#e2e8f0',
             linewidth=1.2, zorder=2
         )
         ax.add_patch(c_box)
         
         ax.text(
-            c["x"] + card_w/2, card_y + card_h - 0.025, c["title"],
+            c["x"] + metric_w/2, card_y + card_h - 0.022, c["title"],
             ha='center', va='center',
-            fontsize=11.5, fontweight='bold', color=c["accent"],
+            fontsize=11.5, fontweight='bold', color='#0f172a',
             zorder=3
         )
         
         ax.text(
-            c["x"] + card_w/2, card_y + card_h - 0.065, c["val"],
+            c["x"] + metric_w/2, card_y + card_h - 0.054, c["val"],
             ha='center', va='center',
-            fontsize=18, fontweight='bold', color='#ffffff',
+            fontsize=17, fontweight='bold', color=c["val_color"],
             zorder=3
         )
         
         ax.text(
-            c["x"] + card_w/2, card_y + card_h - 0.098, c["sub"],
+            c["x"] + metric_w/2, card_y + card_h - 0.080, c["sub"],
             ha='center', va='center',
-            fontsize=9.5, fontweight='normal', color='#94a3b8',
+            fontsize=9.0, fontweight='bold', color='#64748b',
             zorder=3
         )
         
-        pill_w = card_w - 0.028
-        pill_h = 0.032
-        pill_x = c["x"] + 0.014
-        pill_y = card_y + 0.015
+        pill_w = metric_w - 0.024
+        pill_h = 0.027
+        pill_x = c["x"] + 0.012
+        pill_y = card_y + 0.012
         pill_box = FancyBboxPatch(
             (pill_x, pill_y), pill_w, pill_h,
-            boxstyle="round,pad=0.004,rounding_size=0.012",
-            facecolor=c["badge_color"], edgecolor='none',
+            boxstyle="round,pad=0.003,rounding_size=0.008",
+            facecolor=c["badge_bg"], edgecolor='none',
             zorder=3
         )
         ax.add_patch(pill_box)
         ax.text(
-            c["x"] + card_w/2, pill_y + pill_h/2, c["badge"],
+            c["x"] + metric_w/2, pill_y + pill_h/2, c["badge"],
             ha='center', va='center',
-            fontsize=8.2, fontweight='bold', color='#ffffff',
+            fontsize=8.0, fontweight='bold', color='#ffffff',
             zorder=4
         )
 
     # 3. Section Title: Daily Performance
     ax.text(
-        0.5, 0.628, "Daily Performance Breakdown",
+        0.5, 0.704, "Daily Performance",
         ha='center', va='center',
-        fontsize=13, fontweight='bold', color='#e2e8f0',
+        fontsize=13, fontweight='bold', color='#0f172a',
         zorder=3
     )
-    ax.plot([0.15, 0.85], [0.612, 0.612], color='#1d6e43', lw=1.0, zorder=2)
+    ax.plot([0.30, 0.70], [0.692, 0.692], color='#e2e8f0', lw=1.2, zorder=2)
 
     # 4. Bar Chart Sub-Axes
-    chart_ax = fig.add_axes([0.10, 0.225, 0.80, 0.355])
-    chart_ax.set_facecolor('#0b2e1d')
+    chart_ax = fig.add_axes([0.10, 0.445, 0.80, 0.235])
+    chart_ax.set_facecolor('#ffffff')
     
-    for spine in chart_ax.spines.values():
-        spine.set_color('#1d6e43')
-        spine.set_linewidth(1.0)
-        
+    for spine in ['top', 'right', 'left']:
+        chart_ax.spines[spine].set_visible(False)
+    chart_ax.spines['bottom'].set_color('#cbd5e1')
+    chart_ax.spines['bottom'].set_linewidth(1.0)
+    
     days = [s["day"] for s in daily_stats]
-    pcts = [s["uptime_pct"] for s in daily_stats]
-    dates = [s["date"] for s in daily_stats]
+    pcts = [s["pct"] for s in daily_stats]
     x_pos = np.arange(len(days))
     
     max_pct = max(pcts) if pcts else 100
@@ -491,102 +544,163 @@ def generate_infographic_image(metrics: Dict[str, Any], output_path: str) -> str
     chart_ax.set_ylim(0, y_lim)
     chart_ax.set_xlim(-0.6, len(days) - 0.4)
     
-    chart_ax.grid(axis='y', linestyle='--', alpha=0.25, color='#22c55e', zorder=1)
+    chart_ax.grid(axis='y', linestyle=':', alpha=0.6, color='#cbd5e1', zorder=1)
     chart_ax.set_axisbelow(True)
     
-    bar_width = 0.55
+    bar_width = 0.52
     bars = chart_ax.bar(
         x_pos, pcts, width=bar_width,
-        color='#22c55e', edgecolor='#4ade80',
+        color='#22c55e', edgecolor='#16a34a',
         linewidth=1.2, zorder=3,
-        alpha=0.92
+        alpha=0.90
     )
     
-    # Value labels above bars
     for bar, p in zip(bars, pcts):
         h = bar.get_height()
         chart_ax.text(
-            bar.get_x() + bar.get_width() / 2.0, h + (y_lim * 0.025),
+            bar.get_x() + bar.get_width() / 2.0, h + (y_lim * 0.03),
             f"{p:.1f}%",
             ha='center', va='bottom',
-            fontsize=9.5, fontweight='bold', color='#ffffff',
+            fontsize=10.0, fontweight='bold', color='#15803d',
             zorder=4
         )
         
-    # Average reference line across chart
+    # Dashed average line across chart
     cw_pct = cw['uptime_pct']
     chart_ax.axhline(
-        y=cw_pct, color='#facc15', linestyle=':',
-        linewidth=1.5, zorder=4
+        y=cw_pct, color='#94a3b8', linestyle='--',
+        linewidth=1.2, zorder=2
     )
-    # Position reference text neatly on the top left or above line
+    # Position benchmark label safely at top left
     chart_ax.text(
         0.02, 0.95,
-        f"--- Weekly Avg: {cw_pct:.1f}%",
+        f"Weekly Avg: {cw_pct:.1f}%",
         transform=chart_ax.transAxes,
         ha='left', va='top',
-        fontsize=9.0, fontweight='bold', color='#facc15',
-        zorder=5,
-        bbox=dict(boxstyle="round,pad=0.2", facecolor='#0b2b1a', edgecolor='#facc15', lw=0.8, alpha=0.85)
+        fontsize=8.5, fontweight='bold', color='#64748b',
+        zorder=4,
+        bbox=dict(boxstyle="round,pad=0.2", facecolor='#f8fafc', edgecolor='#cbd5e1', lw=0.8, alpha=0.9)
     )
 
-    # X-axis ticks with Day + Date
-    tick_labels = [f"{day}\n{dt}" for day, dt in zip(days, dates)]
     chart_ax.set_xticks(x_pos)
-    chart_ax.set_xticklabels(tick_labels, fontsize=9.5, fontweight='bold', color='#cbd5e1')
+    chart_ax.set_xticklabels(days, fontsize=10.0, fontweight='bold', color='#334155')
     chart_ax.tick_params(axis='x', length=0, pad=6)
-    
     chart_ax.tick_params(axis='y', colors='#94a3b8', labelsize=8.5)
     chart_ax.yaxis.set_major_formatter(ticker.PercentFormatter(xmax=100, decimals=0))
 
-    # 5. Bottom Summary Pills
+    # 5. DATA TABLE SECTION (Requirement 1)
+    table_top = 0.405
+    table_w = 0.87
+    table_x = 0.065
+    row_h = 0.0255
+    num_rows = len(daily_stats)
+    table_h = (num_rows + 1) * row_h
+    
+    table_box = FancyBboxPatch(
+        (table_x, table_top - table_h), table_w, table_h,
+        boxstyle="round,pad=0.004,rounding_size=0.015",
+        facecolor='#ffffff', edgecolor='#cbd5e1',
+        linewidth=1.2, zorder=2
+    )
+    ax.add_patch(table_box)
+    
+    header_y = table_top - row_h
+    header_box = FancyBboxPatch(
+        (table_x, header_y), table_w, row_h,
+        boxstyle="round,pad=0.003,rounding_size=0.012",
+        facecolor='#f1f5f9', edgecolor='none',
+        zorder=3
+    )
+    ax.add_patch(header_box)
+    
+    col_date_x = table_x + 0.03
+    col_avail_x = table_x + 0.38
+    col_uptime_x = table_x + 0.62
+    col_outage_x = table_x + 0.82
+    
+    ax.text(col_date_x, header_y + row_h/2, "Date", ha='left', va='center', fontsize=9.0, fontweight='bold', color='#1e293b', zorder=4)
+    ax.text(col_avail_x, header_y + row_h/2, "Total Availability", ha='center', va='center', fontsize=9.0, fontweight='bold', color='#1e293b', zorder=4)
+    ax.text(col_uptime_x, header_y + row_h/2, "% Uptime", ha='center', va='center', fontsize=9.0, fontweight='bold', color='#1e293b', zorder=4)
+    ax.text(col_outage_x, header_y + row_h/2, "Total Outage", ha='center', va='center', fontsize=9.0, fontweight='bold', color='#1e293b', zorder=4)
+    
+    for idx, row in enumerate(daily_stats):
+        cur_row_y = header_y - (idx + 1) * row_h
+        row_bg = '#ffffff' if idx % 2 == 0 else '#f8fafc'
+        
+        row_rect = Rectangle(
+            (table_x + 0.005, cur_row_y), table_w - 0.01, row_h,
+            facecolor=row_bg, edgecolor='none', zorder=2
+        )
+        ax.add_patch(row_rect)
+        ax.plot([table_x + 0.01, table_x + table_w - 0.01], [cur_row_y, cur_row_y], color='#f1f5f9', lw=0.8, zorder=3)
+        
+        ax.text(col_date_x, cur_row_y + row_h/2, row["full_date"], ha='left', va='center', fontsize=8.5, fontweight='bold', color='#334155', zorder=4)
+        ax.text(col_avail_x, cur_row_y + row_h/2, row["avail"], ha='center', va='center', fontsize=8.5, fontweight='bold', color='#0f172a', zorder=4)
+        ax.text(col_uptime_x, cur_row_y + row_h/2, f"{row['pct']:.1f}%", ha='center', va='center', fontsize=8.5, fontweight='bold', color='#15803d', zorder=4)
+        ax.text(col_outage_x, cur_row_y + row_h/2, f"{row['outages']}", ha='center', va='center', fontsize=8.5, fontweight='bold', color='#b91c1c', zorder=4)
+
+    # 6. BOTTOM SUMMARY SECTION (Requirements 2, 3, 4)
+    bottom_y = 0.062
+    bottom_h = 0.085
     bottom_box = FancyBboxPatch(
-        (0.065, 0.082), 0.87, 0.095,
-        boxstyle="round,pad=0.008,rounding_size=0.02",
-        facecolor='#0b2b1a', edgecolor='#1d6e43',
+        (0.065, bottom_y), 0.87, bottom_h,
+        boxstyle="round,pad=0.006,rounding_size=0.018",
+        facecolor='#f8fafc', edgecolor='#e2e8f0',
         linewidth=1.2, zorder=2
     )
     ax.add_patch(bottom_box)
     
     wow_diff = wow["uptime_diff_pct"]
     wow_sign = "+" if wow_diff >= 0 else ""
-    wow_arrow = "▲" if wow_diff >= 0 else "▼"
     
-    best_day_name, best_day_val = metrics.get("best_day", ("N/A", 0.0))
-    best_day_str = f"{best_day_name} ({best_day_val:.1f}%)" if best_day_name != "N/A" else "N/A"
-    
+    # Row 1: MTD & WoW
     ax.text(
-        0.5, 0.146,
-        f"Month-to-Date Avg: {mtd['uptime_pct']:.1f}%    •    Week-on-Week: {wow_sign}{wow_diff:.1f}% {wow_arrow}",
+        0.5, bottom_y + bottom_h - 0.024,
+        f"Month-to-Date Avg: {mtd['uptime_pct']:.1f}%    •    Week-on-Week: {wow_sign}{wow_diff:.1f}%",
         ha='center', va='center',
-        fontsize=10.5, fontweight='bold', color='#f1f5f9',
+        fontsize=10.0, fontweight='bold', color='#0f172a',
         zorder=3
     )
     
-    days_100 = mtd.get("days_with_100_pct", 0)
-    top_extra = f"100% Uptime: {days_100} day{'s' if days_100 != 1 else ''}" if days_100 > 0 else f"Band {feeder['band']} Target Tracking"
+    # Row 2: Top Day (Days hrs duration included) & Grid Target: Minimum Not Met (RED FONT)
+    target_text = f"Grid Target: {gt['status_text']}"
+    target_color = '#15803d' if gt['is_met'] else '#dc2626'  # Red font for Minimum Not Met
     
     ax.text(
-        0.5, 0.108,
-        f"Top Day: {best_day_str}    •    {top_extra}",
+        0.28, bottom_y + 0.024,
+        f"Top Day: {metrics['top_day_str']}",
         ha='center', va='center',
-        fontsize=9.5, fontweight='normal', color='#94a3b8',
+        fontsize=9.2, fontweight='bold', color='#047857',
+        zorder=3
+    )
+    
+    ax.text(
+        0.52, bottom_y + 0.024,
+        "•",
+        ha='center', va='center',
+        fontsize=10.0, fontweight='bold', color='#94a3b8',
+        zorder=3
+    )
+    
+    ax.text(
+        0.74, bottom_y + 0.024,
+        target_text,
+        ha='center', va='center',
+        fontsize=9.5, fontweight='bold', color=target_color,
         zorder=3
     )
 
-    # 6. Footer branding
+    # 7. Footer
     ax.text(
-        0.5, 0.046,
-        "Power Tracker Intelligence  •  Weekly Snapshot System",
+        0.5, 0.030,
+        "Power Tracker Intelligence  •  Automated Weekly Snapshot System",
         ha='center', va='center',
-        fontsize=8.5, color='#4ade80', alpha=0.7,
+        fontsize=8.5, color='#94a3b8',
         zorder=3
     )
 
-    # Ensure output directory exists
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     
-    # Save optimized JPEG (100 DPI, 75% quality for lightweight WhatsApp sending)
     buf = io.BytesIO()
     plt.savefig(
         buf, format='jpeg', dpi=100,
@@ -611,7 +725,7 @@ def generate_weekly_power_infographic(
     Main entry point:
     1. Computes all weekly metrics.
     2. Formats WhatsApp text summary.
-    3. Generates lightweight infographic JPG.
+    3. Generates lightweight white-background infographic JPG with table.
     Returns: (text_summary, image_filename, metrics_dict).
     """
     metrics = get_weekly_metrics(feeder_id=feeder_id, target_sunday=target_sunday)
