@@ -111,21 +111,18 @@ def get_weekly_metrics(feeder_id: int, target_sunday: Optional[date] = None) -> 
     """
     Query database and compute weekly metrics (Sunday to Saturday),
     comparing current week vs last week and computing MTD & WoW metrics.
-    Uses optimized single-query event streaming to minimize network overhead.
     """
     now = datetime.now(LAGOS_TZ)
     if target_sunday is None:
-        # Determine the most recently completed Saturday
         days_since_sat = (now.weekday() - 5) % 7
         if days_since_sat == 0:
-            days_since_sat = 7  # If today is Saturday, report the previous completed week
+            days_since_sat = 7
         sat_date = (now - timedelta(days=days_since_sat)).date()
         sun_date = sat_date - timedelta(days=6)
     else:
         sun_date = target_sunday
         sat_date = sun_date + timedelta(days=6)
 
-    # 1. Define time boundaries in Lagos timezone
     cw_start = LAGOS_TZ.localize(datetime.combine(sun_date, dtime.min))
     cw_end = LAGOS_TZ.localize(datetime.combine(sat_date, dtime.max))
     
@@ -183,22 +180,18 @@ def get_weekly_metrics(feeder_id: int, target_sunday: Optional[date] = None) -> 
     def get_events_between(t_start: datetime, t_end: datetime):
         return [(st, st_time) for st, st_time in events if t_start <= st_time <= t_end]
 
-    # Current Week Metrics
     cw_events = get_events_between(cw_start, cw_end)
     cw_state = get_state_before(cw_start)
     cw_metrics = compute_interval_metrics(cw_events, cw_state, cw_start, cw_end)
     
-    # Last Week Metrics
     lw_events = get_events_between(lw_start, lw_end)
     lw_state = get_state_before(lw_start)
     lw_metrics = compute_interval_metrics(lw_events, lw_state, lw_start, lw_end)
     
-    # Month-to-Date Metrics
     mtd_events = get_events_between(mtd_start, mtd_end)
     mtd_state = get_state_before(mtd_start)
     mtd_metrics = compute_interval_metrics(mtd_events, mtd_state, mtd_start, mtd_end)
     
-    # Daily Breakdown (Sunday to Saturday)
     daily_stats = []
     days_100_pct = 0
     best_day_name = None
@@ -225,7 +218,7 @@ def get_weekly_metrics(feeder_id: int, target_sunday: Optional[date] = None) -> 
         daily_stats.append({
             "day": d_date.strftime("%a"),
             "date": d_date.strftime("%d/%m"),
-            "full_date": d_date.strftime("%a %b %d, %Y"),  # e.g. Mon Aug 01, 2012 format
+            "full_date": d_date.strftime("%a %b %d, %Y"),
             "avail": format_duration_hours_mins(up_sec),
             "pct": round(pct, 1),
             "uptime_pct": round(pct, 1),
@@ -234,16 +227,13 @@ def get_weekly_metrics(feeder_id: int, target_sunday: Optional[date] = None) -> 
             "outages": d_res['outages']
         })
 
-    # Week-on-Week comparisons
     wow_uptime_diff = round(cw_metrics['uptime_pct'] - lw_metrics['uptime_pct'], 1)
     wow_downtime_diff_hours = round((cw_metrics['downtime_sec'] - lw_metrics['downtime_sec']) / 3600.0, 1)
     wow_outages_diff = cw_metrics['outages'] - lw_metrics['outages']
 
-    # Top Supply Day with Duration (Days hrs)
     top_day_duration_str = format_duration_days_hours(best_day_sec)
-    top_day_formatted = f"{best_day_name} ({top_day_duration_str} • {best_day_pct:.1f}%)" if best_day_name else "N/A"
+    top_day_formatted = f"⭐ {best_day_name} ({top_day_duration_str} • {best_day_pct:.1f}%)" if best_day_name else "N/A"
 
-    # Grid Target Calculation
     band_code = str(feeder_info['band']).strip().upper().replace("BAND", "").strip() or 'D'
     min_required_hours = BAND_MIN_HOURS.get(band_code, 8.0)
     avg_daily_hours = (cw_metrics['uptime_sec'] / 7.0) / 3600.0
@@ -277,10 +267,10 @@ def get_weekly_metrics(feeder_id: int, target_sunday: Optional[date] = None) -> 
             "uptime_change_str": f"▲ Up from {lw_metrics['uptime_pct']:.1f}% last week" if wow_uptime_diff >= 0 else f"▼ Down from {lw_metrics['uptime_pct']:.1f}% last week",
             "downtime_diff_hours": wow_downtime_diff_hours,
             "downtime_improved": wow_downtime_diff_hours <= 0,
-            "downtime_change_str": f"▼ Down from {format_duration_days_hours(lw_metrics['downtime_sec'])} last week" if wow_downtime_diff_hours <= 0 else f"▲ Up from {format_duration_days_hours(lw_metrics['downtime_sec'])} last week",
+            "downtime_change_str": f"▼ Down {abs(wow_downtime_diff_hours)}h vs last week" if wow_downtime_diff_hours <= 0 else f"▲ Up {wow_downtime_diff_hours}h vs last week",
             "outages_diff": wow_outages_diff,
             "outages_improved": wow_outages_diff <= 0,
-            "outages_change_str": f"▼ Down from {lw_metrics['outages']} incidents" if wow_outages_diff <= 0 else f"▲ Up from {lw_metrics['outages']} incidents",
+            "outages_change_str": f"▼ Down from {lw_metrics['outages']} inc." if wow_outages_diff <= 0 else f"▲ Up from {lw_metrics['outages']} inc.",
         },
         "mtd": {
             "uptime_pct": round(mtd_metrics['uptime_pct'], 1),
@@ -298,9 +288,6 @@ def get_weekly_metrics(feeder_id: int, target_sunday: Optional[date] = None) -> 
     }
 
 def generate_whatsapp_summary(metrics: Dict[str, Any]) -> str:
-    """
-    Format WhatsApp-friendly text summary with emojis, table breakdown, and structured markdown.
-    """
     feeder = metrics["feeder"]
     cw = metrics["current_week"]
     wow = metrics["wow_comparison"]
@@ -308,7 +295,6 @@ def generate_whatsapp_summary(metrics: Dict[str, Any]) -> str:
     gt = metrics["grid_target"]
     week_disp = metrics["week_range"]["display"]
     
-    # Emojis and indicators
     up_icon = "🟢" if wow["uptime_improved"] else "🔴"
     down_icon = "🟢" if wow["downtime_improved"] else "🔴"
     outage_icon = "🟢" if wow["outages_improved"] else "🔴"
@@ -325,7 +311,7 @@ def generate_whatsapp_summary(metrics: Dict[str, Any]) -> str:
         f"⚡ *Uptime:* {cw['uptime_pct']}% ({cw['uptime_duration']})",
         f"   └ {wow['uptime_change_str']} ({wow_sign}{wow['uptime_diff_pct']}%) {up_icon}",
         "",
-        f"⏱️ *Total Downtime:* {cw['downtime_duration']}",
+        f"⏱️ *Total Downtime:* {cw['downtime_duration']} ({100 - cw['uptime_pct']:.1f}% off-grid)",
         f"   └ {wow['downtime_change_str']} {down_icon}",
         "",
         f"🔌 *Power Outages:* {cw['outages']} incidents",
@@ -356,10 +342,9 @@ def generate_whatsapp_summary(metrics: Dict[str, Any]) -> str:
 
 def generate_infographic_image(metrics: Dict[str, Any], output_path: str) -> str:
     """
-    Generate a world-class infographic chart snapshot using Matplotlib,
-    featuring a clean white background, headline KPI cards, 7-day daily bar chart,
-    tabular breakdown, and red-font Minimum Not Met grid target status.
-    Exported as an ultra-compact JPEG (~85-95 KB).
+    Generate an enhanced infographic chart snapshot using Matplotlib,
+    incorporating dynamic color gradients, availability bar labels, grid benchmark line,
+    and high-contrast typography. Exported as an ultra-compact JPEG (~85-95 KB).
     """
     feeder = metrics["feeder"]
     cw = metrics["current_week"]
@@ -369,8 +354,8 @@ def generate_infographic_image(metrics: Dict[str, Any], output_path: str) -> str
     daily_stats = metrics["daily_breakdown"]
     date_range_str = metrics["week_range"]["display"]
     
-    # Dimensions: 8.2 x 14.2 inches at 100 DPI -> 820 x 1420 px
-    fig_w, fig_h = 8.2, 14.2
+    # Dimensions: 8.2 x 13.0 inches at 100 DPI -> 820 x 1300 px
+    fig_w, fig_h = 8.2, 13.0
     fig = plt.figure(figsize=(fig_w, fig_h), dpi=100)
     fig.patch.set_facecolor('#f8fafc')
     
@@ -396,44 +381,43 @@ def generate_infographic_image(metrics: Dict[str, Any], output_path: str) -> str
     
     # 1. Header Section
     ax.text(
-        0.5, 0.962, "⚡ Weekly Power Report Snapshot",
+        0.5, 0.958, "⚡ Weekly Power Report Snapshot",
         ha='center', va='center',
         fontsize=18, fontweight='bold', color='#0f172a',
         zorder=3
     )
     
-    # Feeder & Band Badge
+    # Feeder Name in Bold Green for Stronger Identity
     band_clean = str(feeder['band']).replace('Band', '').strip()
     feeder_badge_text = f"{feeder['name']}  •  Band {band_clean}"
-    badge_w = min(0.68, max(0.42, len(feeder_badge_text) * 0.018 + 0.18))
+    badge_w = min(0.72, max(0.45, len(feeder_badge_text) * 0.018 + 0.18))
     badge_x = (1.0 - badge_w) / 2.0
     badge_box = FancyBboxPatch(
-        (badge_x, 0.925), badge_w, 0.026,
+        (badge_x, 0.915), badge_w, 0.028,
         boxstyle="round,pad=0.004,rounding_size=0.012",
         facecolor='#f0fdf4', edgecolor='#86efac',
         linewidth=1.2, zorder=2
     )
     ax.add_patch(badge_box)
     ax.text(
-        0.5, 0.938, feeder_badge_text,
+        0.5, 0.929, feeder_badge_text,
         ha='center', va='center',
-        fontsize=11, fontweight='bold', color='#15803d',
+        fontsize=12, fontweight='heavy', color='#047857',
         zorder=3
     )
     
     # Date Subtitle
     ax.text(
-        0.5, 0.902, f"{date_range_str}",
+        0.5, 0.888, f"{date_range_str}",
         ha='center', va='center',
         fontsize=11, fontweight='bold', color='#64748b',
         zorder=3
     )
     
-    # Subtle separator
-    ax.plot([0.08, 0.92], [0.884, 0.884], color='#f1f5f9', lw=1.5, zorder=2)
+    ax.plot([0.08, 0.92], [0.870, 0.870], color='#f1f5f9', lw=1.5, zorder=2)
 
-    # 2. Three Metric Cards (Uptime, Downtime, Outages)
-    card_y = 0.738
+    # 2. Three Metric Cards (Uptime, Downtime, Outages) with Durations & Percentages
+    card_y = 0.718
     card_h = 0.134
     metric_w = 0.275
     gap = 0.022
@@ -445,22 +429,22 @@ def generate_infographic_image(metrics: Dict[str, Any], output_path: str) -> str
             "title": "⚡ Uptime:",
             "val": f"{cw['uptime_pct']:.1f}%",
             "val_color": '#15803d',
-            "sub": cw['uptime_duration'],
+            "sub": f"({cw['uptime_duration']})",
             "badge": wow['uptime_change_str'],
             "badge_bg": '#16a34a' if wow['uptime_improved'] else '#dc2626',
         },
         {
             "x": start_x + metric_w + gap,
-            "title": "Downtime:",
+            "title": "⏱️ Downtime:",
             "val": cw['downtime_duration'],
             "val_color": '#1e3a8a',
-            "sub": f"{100 - cw['uptime_pct']:.1f}% off-grid",
+            "sub": f"({100 - cw['uptime_pct']:.1f}% off-grid)",
             "badge": wow['downtime_change_str'],
             "badge_bg": '#16a34a' if wow['downtime_improved'] else '#dc2626',
         },
         {
             "x": start_x + 2 * (metric_w + gap),
-            "title": "Outages:",
+            "title": "🔌 Outages:",
             "val": f"{cw['outages']} incidents",
             "val_color": '#b91c1c',
             "sub": "total power cuts",
@@ -488,7 +472,7 @@ def generate_infographic_image(metrics: Dict[str, Any], output_path: str) -> str
         ax.text(
             c["x"] + metric_w/2, card_y + card_h - 0.054, c["val"],
             ha='center', va='center',
-            fontsize=17, fontweight='bold', color=c["val_color"],
+            fontsize=16, fontweight='bold', color=c["val_color"],
             zorder=3
         )
         
@@ -519,15 +503,15 @@ def generate_infographic_image(metrics: Dict[str, Any], output_path: str) -> str
 
     # 3. Section Title: Daily Performance
     ax.text(
-        0.5, 0.704, "Daily Performance",
+        0.5, 0.680, "Daily Performance & Availability",
         ha='center', va='center',
         fontsize=13, fontweight='bold', color='#0f172a',
         zorder=3
     )
-    ax.plot([0.30, 0.70], [0.692, 0.692], color='#e2e8f0', lw=1.2, zorder=2)
+    ax.plot([0.30, 0.70], [0.668, 0.668], color='#e2e8f0', lw=1.2, zorder=2)
 
-    # 4. Bar Chart Sub-Axes
-    chart_ax = fig.add_axes([0.10, 0.445, 0.80, 0.235])
+    # 4. Bar Chart Sub-Axes (Dynamic Gradient & Availability Labels)
+    chart_ax = fig.add_axes([0.10, 0.280, 0.80, 0.365])
     chart_ax.set_facecolor('#ffffff')
     
     for spine in ['top', 'right', 'left']:
@@ -537,49 +521,63 @@ def generate_infographic_image(metrics: Dict[str, Any], output_path: str) -> str
     
     days = [s["day"] for s in daily_stats]
     pcts = [s["pct"] for s in daily_stats]
+    avails = [s["avail"] for s in daily_stats]
     x_pos = np.arange(len(days))
     
     max_pct = max(pcts) if pcts else 100
-    y_lim = min(100.0, max(max_pct * 1.25, 35.0))
+    y_lim = min(100.0, max(max_pct * 1.25, 40.0))
     chart_ax.set_ylim(0, y_lim)
     chart_ax.set_xlim(-0.6, len(days) - 0.4)
     
     chart_ax.grid(axis='y', linestyle=':', alpha=0.6, color='#cbd5e1', zorder=1)
     chart_ax.set_axisbelow(True)
     
+    # Dynamic Color Gradient: Green >80%, Amber 40-80%, Red <40%
+    bar_colors = []
+    bar_edges = []
+    for p in pcts:
+        if p >= 80.0:
+            bar_colors.append('#22c55e')
+            bar_edges.append('#16a34a')
+        elif p >= 40.0:
+            bar_colors.append('#f59e0b')
+            bar_edges.append('#d97706')
+        else:
+            bar_colors.append('#ef4444')
+            bar_edges.append('#dc2626')
+
     bar_width = 0.52
     bars = chart_ax.bar(
         x_pos, pcts, width=bar_width,
-        color='#22c55e', edgecolor='#16a34a',
+        color=bar_colors, edgecolor=bar_edges,
         linewidth=1.2, zorder=3,
         alpha=0.90
     )
     
-    for bar, p in zip(bars, pcts):
+    # Render Availability (hr min) and % labels above bars
+    for bar, p, avail in zip(bars, pcts, avails):
         h = bar.get_height()
         chart_ax.text(
             bar.get_x() + bar.get_width() / 2.0, h + (y_lim * 0.03),
-            f"{p:.1f}%",
+            f"{avail}\n({p:.1f}%)",
             ha='center', va='bottom',
-            fontsize=10.0, fontweight='bold', color='#15803d',
+            fontsize=8.5, fontweight='bold', color='#1e293b',
             zorder=4
         )
         
-    # Dashed average line across chart
-    cw_pct = cw['uptime_pct']
+    # Grid Target Benchmark Line
+    target_pct = (gt['min_required_hours'] / 24.0) * 100.0
     chart_ax.axhline(
-        y=cw_pct, color='#94a3b8', linestyle='--',
-        linewidth=1.2, zorder=2
+        y=target_pct, color='#dc2626', linestyle='--',
+        linewidth=1.4, zorder=2
     )
-    # Position benchmark label safely at top left
     chart_ax.text(
-        0.02, 0.95,
-        f"Weekly Avg: {cw_pct:.1f}%",
-        transform=chart_ax.transAxes,
-        ha='left', va='top',
-        fontsize=8.5, fontweight='bold', color='#64748b',
+        len(days) - 0.5, target_pct + 2.5,
+        f"Grid Target ({gt['min_required_hours']}h/day)",
+        ha='right', va='bottom',
+        fontsize=8.5, fontweight='bold', color='#dc2626',
         zorder=4,
-        bbox=dict(boxstyle="round,pad=0.2", facecolor='#f8fafc', edgecolor='#cbd5e1', lw=0.8, alpha=0.9)
+        bbox=dict(boxstyle="round,pad=0.2", facecolor='#fef2f2', edgecolor='#fca5a5', lw=0.8, alpha=0.9)
     )
 
     chart_ax.set_xticks(x_pos)
@@ -588,60 +586,9 @@ def generate_infographic_image(metrics: Dict[str, Any], output_path: str) -> str
     chart_ax.tick_params(axis='y', colors='#94a3b8', labelsize=8.5)
     chart_ax.yaxis.set_major_formatter(ticker.PercentFormatter(xmax=100, decimals=0))
 
-    # 5. DATA TABLE SECTION (Requirement 1)
-    table_top = 0.405
-    table_w = 0.87
-    table_x = 0.065
-    row_h = 0.0255
-    num_rows = len(daily_stats)
-    table_h = (num_rows + 1) * row_h
-    
-    table_box = FancyBboxPatch(
-        (table_x, table_top - table_h), table_w, table_h,
-        boxstyle="round,pad=0.004,rounding_size=0.015",
-        facecolor='#ffffff', edgecolor='#cbd5e1',
-        linewidth=1.2, zorder=2
-    )
-    ax.add_patch(table_box)
-    
-    header_y = table_top - row_h
-    header_box = FancyBboxPatch(
-        (table_x, header_y), table_w, row_h,
-        boxstyle="round,pad=0.003,rounding_size=0.012",
-        facecolor='#f1f5f9', edgecolor='none',
-        zorder=3
-    )
-    ax.add_patch(header_box)
-    
-    col_date_x = table_x + 0.03
-    col_avail_x = table_x + 0.38
-    col_uptime_x = table_x + 0.62
-    col_outage_x = table_x + 0.82
-    
-    ax.text(col_date_x, header_y + row_h/2, "Date", ha='left', va='center', fontsize=9.0, fontweight='bold', color='#1e293b', zorder=4)
-    ax.text(col_avail_x, header_y + row_h/2, "Total Availability", ha='center', va='center', fontsize=9.0, fontweight='bold', color='#1e293b', zorder=4)
-    ax.text(col_uptime_x, header_y + row_h/2, "% Uptime", ha='center', va='center', fontsize=9.0, fontweight='bold', color='#1e293b', zorder=4)
-    ax.text(col_outage_x, header_y + row_h/2, "Total Outage", ha='center', va='center', fontsize=9.0, fontweight='bold', color='#1e293b', zorder=4)
-    
-    for idx, row in enumerate(daily_stats):
-        cur_row_y = header_y - (idx + 1) * row_h
-        row_bg = '#ffffff' if idx % 2 == 0 else '#f8fafc'
-        
-        row_rect = Rectangle(
-            (table_x + 0.005, cur_row_y), table_w - 0.01, row_h,
-            facecolor=row_bg, edgecolor='none', zorder=2
-        )
-        ax.add_patch(row_rect)
-        ax.plot([table_x + 0.01, table_x + table_w - 0.01], [cur_row_y, cur_row_y], color='#f1f5f9', lw=0.8, zorder=3)
-        
-        ax.text(col_date_x, cur_row_y + row_h/2, row["full_date"], ha='left', va='center', fontsize=8.5, fontweight='bold', color='#334155', zorder=4)
-        ax.text(col_avail_x, cur_row_y + row_h/2, row["avail"], ha='center', va='center', fontsize=8.5, fontweight='bold', color='#0f172a', zorder=4)
-        ax.text(col_uptime_x, cur_row_y + row_h/2, f"{row['pct']:.1f}%", ha='center', va='center', fontsize=8.5, fontweight='bold', color='#15803d', zorder=4)
-        ax.text(col_outage_x, cur_row_y + row_h/2, f"{row['outages']}", ha='center', va='center', fontsize=8.5, fontweight='bold', color='#b91c1c', zorder=4)
-
-    # 6. BOTTOM SUMMARY SECTION (Requirements 2, 3, 4)
-    bottom_y = 0.062
-    bottom_h = 0.085
+    # 5. BOTTOM SUMMARY SECTION
+    bottom_y = 0.055
+    bottom_h = 0.115
     bottom_box = FancyBboxPatch(
         (0.065, bottom_y), 0.87, bottom_h,
         boxstyle="round,pad=0.006,rounding_size=0.018",
@@ -653,21 +600,18 @@ def generate_infographic_image(metrics: Dict[str, Any], output_path: str) -> str
     wow_diff = wow["uptime_diff_pct"]
     wow_sign = "+" if wow_diff >= 0 else ""
     
-    # Row 1: MTD & WoW
     ax.text(
-        0.5, bottom_y + bottom_h - 0.024,
+        0.5, bottom_y + bottom_h - 0.032,
         f"Month-to-Date Avg: {mtd['uptime_pct']:.1f}%    •    Week-on-Week: {wow_sign}{wow_diff:.1f}%",
         ha='center', va='center',
         fontsize=10.0, fontweight='bold', color='#0f172a',
         zorder=3
     )
     
-    # Row 2: Top Day (Days hrs duration included) & Grid Target: Minimum Not Met (RED FONT)
-    target_text = f"Grid Target: {gt['status_text']}"
-    target_color = '#15803d' if gt['is_met'] else '#dc2626'  # Red font for Minimum Not Met
+    target_color = '#15803d' if gt['is_met'] else '#dc2626'
     
     ax.text(
-        0.28, bottom_y + 0.024,
+        0.28, bottom_y + 0.035,
         f"Top Day: {metrics['top_day_str']}",
         ha='center', va='center',
         fontsize=9.2, fontweight='bold', color='#047857',
@@ -675,7 +619,7 @@ def generate_infographic_image(metrics: Dict[str, Any], output_path: str) -> str
     )
     
     ax.text(
-        0.52, bottom_y + 0.024,
+        0.52, bottom_y + 0.035,
         "•",
         ha='center', va='center',
         fontsize=10.0, fontweight='bold', color='#94a3b8',
@@ -683,16 +627,16 @@ def generate_infographic_image(metrics: Dict[str, Any], output_path: str) -> str
     )
     
     ax.text(
-        0.74, bottom_y + 0.024,
-        target_text,
+        0.74, bottom_y + 0.035,
+        f"Grid Target: {gt['status_text']}",
         ha='center', va='center',
         fontsize=9.5, fontweight='bold', color=target_color,
         zorder=3
     )
 
-    # 7. Footer
+    # 6. Footer
     ax.text(
-        0.5, 0.030,
+        0.5, 0.022,
         "Power Tracker Intelligence  •  Automated Weekly Snapshot System",
         ha='center', va='center',
         fontsize=8.5, color='#94a3b8',
@@ -705,7 +649,7 @@ def generate_infographic_image(metrics: Dict[str, Any], output_path: str) -> str
     plt.savefig(
         buf, format='jpeg', dpi=100,
         bbox_inches='tight', pad_inches=0.1,
-        pil_kwargs={"quality": 75, "optimize": True}
+        pil_kwargs={"quality": 80, "optimize": True}
     )
     plt.close(fig)
     
@@ -713,7 +657,7 @@ def generate_infographic_image(metrics: Dict[str, Any], output_path: str) -> str
         f.write(buf.getvalue())
         
     kb_size = len(buf.getvalue()) / 1024.0
-    logger.info(f"Infographic saved to {output_path} ({kb_size:.1f} KB)")
+    logger.info(f"Enhanced Infographic saved to {output_path} ({kb_size:.1f} KB)")
     return output_path
 
 def generate_weekly_power_infographic(
@@ -721,13 +665,6 @@ def generate_weekly_power_infographic(
     target_sunday: Optional[date] = None,
     output_dir: Optional[str] = None
 ) -> Tuple[str, str, Dict[str, Any]]:
-    """
-    Main entry point:
-    1. Computes all weekly metrics.
-    2. Formats WhatsApp text summary.
-    3. Generates lightweight white-background infographic JPG with table.
-    Returns: (text_summary, image_filename, metrics_dict).
-    """
     metrics = get_weekly_metrics(feeder_id=feeder_id, target_sunday=target_sunday)
     text_summary = generate_whatsapp_summary(metrics)
     
