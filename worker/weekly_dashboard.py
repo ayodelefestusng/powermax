@@ -16,8 +16,9 @@ from PIL import Image
 from sqlalchemy import text
 
 from worker.db import engine
+from worker.logging_config import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 LAGOS_TZ = pytz.timezone("Africa/Lagos")
 
 BAND_MIN_HOURS = {
@@ -60,6 +61,15 @@ def format_duration_hours_mins(seconds: float) -> str:
     hours = total_seconds // 3600
     minutes = (total_seconds % 3600) // 60
     return f"{hours} hrs {minutes} mins"
+
+def format_duration_hrs_mins_colon(seconds: float) -> str:
+    """Format seconds into readable hours and minutes (e.g., '6hrs: 20mins')."""
+    total_mins = int(round(max(0.0, seconds) / 60.0))
+    hours = total_mins // 60
+    minutes = total_mins % 60
+    h_str = "hr" if hours == 1 else "hrs"
+    m_str = "min" if minutes == 1 else "mins"
+    return f"{hours}{h_str}: {minutes}{m_str}"
 
 def compute_interval_metrics(events_window: list, state_at_start: str, start_dt: datetime, end_dt: datetime) -> Dict[str, Any]:
     """
@@ -239,6 +249,9 @@ def get_weekly_metrics(feeder_id: int, target_sunday: Optional[date] = None) -> 
     avg_daily_hours = (cw_metrics['uptime_sec'] / 7.0) / 3600.0
     grid_target_met = avg_daily_hours >= min_required_hours
 
+    mtd_avg_daily_sec = (mtd_metrics['uptime_pct'] / 100.0) * 86400.0
+    mtd_duration_str = format_duration_hrs_mins_colon(mtd_avg_daily_sec)
+
     return {
         "feeder": feeder_info,
         "week_range": {
@@ -274,6 +287,8 @@ def get_weekly_metrics(feeder_id: int, target_sunday: Optional[date] = None) -> 
         },
         "mtd": {
             "uptime_pct": round(mtd_metrics['uptime_pct'], 1),
+            "uptime_duration": mtd_duration_str,
+            "avg_daily_hours": round(mtd_avg_daily_sec / 3600.0, 1),
             "days_with_100_pct": days_100_pct
         },
         "grid_target": {
@@ -329,10 +344,12 @@ def generate_whatsapp_summary(metrics: Dict[str, Any]) -> str:
     for d in metrics["daily_breakdown"]:
         lines.append(f"{d['full_date']:<17} | {d['avail']:<12} | {d['pct']:>6.1f}% | {d['outages']:^7}")
         
+    mtd_dur_str = f" ({mtd['uptime_duration']})" if mtd.get("uptime_duration") else ""
+
     lines.extend([
         "```",
         "",
-        f"📈 *Month-to-Date Avg:* {mtd['uptime_pct']}%",
+        f"📈 *Month-to-Date Avg:* {mtd['uptime_pct']}%{mtd_dur_str}",
         f"🔄 *Week-on-Week Trend:* {wow_sign}{wow['uptime_diff_pct']}% {up_icon}",
         "━━━━━━━━━━━━━━━━━━━━━━━",
         "_Generated automatically by Power Tracker Intelligence_"
@@ -599,12 +616,13 @@ def generate_infographic_image(metrics: Dict[str, Any], output_path: str) -> str
     
     wow_diff = wow["uptime_diff_pct"]
     wow_sign = "+" if wow_diff >= 0 else ""
+    mtd_dur_str = f" ({mtd['uptime_duration']})" if mtd.get("uptime_duration") else ""
     
     ax.text(
         0.5, bottom_y + bottom_h - 0.032,
-        f"Month-to-Date Avg: {mtd['uptime_pct']:.1f}%    •    Week-on-Week: {wow_sign}{wow_diff:.1f}%",
+        f"Month-to-Date Avg: {mtd['uptime_pct']:.1f}%{mtd_dur_str}    •    Week-on-Week: {wow_sign}{wow_diff:.1f}%",
         ha='center', va='center',
-        fontsize=10.0, fontweight='bold', color='#0f172a',
+        fontsize=9.8, fontweight='bold', color='#0f172a',
         zorder=3
     )
     

@@ -1,15 +1,16 @@
 import os
 import re
 import urllib.parse
-import logging
 from celery import Celery
 from celery.schedules import crontab
 from dotenv import load_dotenv
 
+from worker.logging_config import setup_celery_logging
+
 # Load env variables
 load_dotenv()
 
-logger = logging.getLogger(__name__)
+logger = setup_celery_logging(__name__)
 
 def get_broker_and_backend_urls():
     """

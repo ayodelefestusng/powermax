@@ -24,3 +24,8 @@ note2
 *.pid
 *.seed
 *.db
+
+# Generated reports
+generated_reports/
+worker/generated_reports/
+

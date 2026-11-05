@@ -1,44 +1,23 @@
 from datetime import datetime, timezone, timedelta
+import json
 import logging
 from pathlib import Path
+from typing import Optional
 import uuid
+
 from fastapi import FastAPI, HTTPException, Request, status, BackgroundTasks
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, ConfigDict
 from sqlalchemy import text
+
+from worker.logging_config import setup_power_max_logging
+
+# Configure root logger and obtain PowerMonitor logger for power_max (FastAPI Gateway)
+logger = setup_power_max_logging()
 
 from worker.celery_app import celery_app
 from worker.db import engine
 from worker.tasks import send_whatsapp_power_message, generate_power_report, FeederObj
-from fastapi import FastAPI, Request, status, HTTPException
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, ConfigDict
-from datetime import datetime, timezone, timedelta
-from typing import Optional
-import json
-
-# Logger configuration
-# logging.basicConfig(level=logging.INFO)
-# logger = logging.getLogger("WorkerGateway")
-
-
-# Configure root logging to output to console only
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    handlers=[logging.StreamHandler()],
-)
-
-# Configure PowerMonitor logger to output to both console (via propagation) and file
-logger = logging.getLogger("PowerMonitor")
-logger.setLevel(logging.INFO)
-
-log_dir = Path(__file__).parent / "logs"
-log_dir.mkdir(exist_ok=True)
-log_file = log_dir / "app.log"
-file_handler = logging.FileHandler(log_file)
-file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
-logger.addHandler(file_handler)
 
 app = FastAPI(title="FastAPI Worker Gateway API")
 
@@ -124,85 +103,57 @@ async def power_update(request: Request):
         volt_b = payload.get("volt_b", 0.0)
 
         # 4. Handle timing metrics & timestamp adoption
-        # server_time_dt = datetime.now(lagos_tz)
-        # server_time = server_time_dt.strftime("%Y-%m-%d %H:%M:%S") + f".{int(server_time_dt.microsecond / 1000):03d}"
-        
-        # use_server_time = False
-        # adopted_time_dt = server_time_dt
-        # try:
-        #     raw_ts = float(timestamp) if timestamp is not None else 0.0
-        #     if raw_ts <= 0:
-        #         use_server_time = True
-        #     else:
-        #         if raw_ts > 1e11:  # epoch in milliseconds
-        #             raw_ts /= 1000.0
-        #         payload_time_dt = datetime.fromtimestamp(raw_ts, tz=lagos_tz)
-        #         drift_seconds = abs((server_time_dt - payload_time_dt).total_seconds())
-        #         if drift_seconds > 8 * 3600:
-        #             use_server_time = True
-        #             logger.warning(
-        #                 f"Timestamp drift ({drift_seconds/3600:.2f}h) exceeds 8-hour threshold. "
-        #                 f"Adopting server time instead of payload timestamp {timestamp}."
-        #             )
-        #         else:
-        #             adopted_time_dt = payload_time_dt
-        # except (ValueError, TypeError, OverflowError, OSError) as ts_err:
-        #     logger.warning(f"Could not parse payload timestamp '{timestamp}': {ts_err}. Adopting server time.")
-        #     use_server_time = True
-
-        # if use_server_time:
-        #     effective_timestamp = int(server_time_dt.timestamp())
-        #     human_timestamp = server_time_dt.strftime("%Y-%m-%d %H:%M:%S")
-        # else:
-        #     effective_timestamp = int(adopted_time_dt.timestamp())
-        #     human_timestamp = adopted_time_dt.strftime("%Y-%m-%d %H:%M:%S")
-        
-        
-        # 4. Handle timing metrics & timestamp adoption
-        server_time_dt = datetime.now(lagos_tz)
-        server_time = server_time_dt.strftime("%Y-%m-%d %H:%M:%S") + f".{int(server_time_dt.microsecond / 1000):03d}"
+        now_server_dt = datetime.now(lagos_tz)
+        now_server_str = now_server_dt.strftime("%Y-%m-%d %H:%M:%S") + f".{int(now_server_dt.microsecond / 1000):03d}"
 
         use_server_time = False
-        adopted_time_dt = server_time_dt
+        adopted_time_dt = now_server_dt
 
         try:
             raw_ts = float(timestamp) if timestamp is not None else 0.0
             if raw_ts <= 0:
                 # MCU sent 0 → fallback
                 use_server_time = True
-                logger.warning("MCU timestamp is 0. Falling back to server time.")
+                logger.warning("MCU timestamp is 0 or missing. Falling back to server arrival time.")
             else:
                 # Normalize if epoch is in milliseconds
                 if raw_ts > 1e11:
                     raw_ts /= 1000.0
 
                 payload_time_dt = datetime.fromtimestamp(raw_ts, tz=lagos_tz)
-                drift_seconds = abs((server_time_dt - payload_time_dt).total_seconds())
+                drift_seconds = abs((now_server_dt - payload_time_dt).total_seconds())
 
                 logger.info(
-                    f"RTC timestamp {payload_time_dt}, Server time {server_time_dt}, Drift {drift_seconds:.1f}s"
+                    f"RTC timestamp {payload_time_dt}, Server time {now_server_dt}, Drift {drift_seconds:.1f}s"
                 )
 
                 # Drift guardrail: allow up to 24 hours difference
-                if drift_seconds > 24 * 3600:
+                if drift_seconds >= 24 * 3600:
                     use_server_time = True
                     logger.warning(
                         f"Timestamp drift ({drift_seconds/3600:.2f}h) exceeds 24-hour threshold. "
-                        f"Adopting server time instead of payload timestamp {timestamp}."
+                        f"Falling back to server arrival time instead of payload timestamp {timestamp}."
                     )
                 else:
+                    # Drift is less than 24 hours: adopt the raw payload timestamp for DB server_time
                     adopted_time_dt = payload_time_dt
+                    use_server_time = False
+                    logger.info(
+                        f"Payload raw timestamp adopted for DB server_time (drift: {drift_seconds:.1f}s < 24h): {adopted_time_dt}"
+                    )
 
         except (ValueError, TypeError, OverflowError, OSError) as ts_err:
-            logger.warning(f"Could not parse payload timestamp '{timestamp}': {ts_err}. Adopting server time.")
+            logger.warning(f"Could not parse payload timestamp '{timestamp}': {ts_err}. Adopting server arrival time.")
             use_server_time = True
 
         if use_server_time:
-            effective_timestamp = int(server_time_dt.timestamp())
-            human_timestamp = server_time_dt.strftime("%Y-%m-%d %H:%M:%S")
+            effective_timestamp = int(now_server_dt.timestamp())
+            human_timestamp = now_server_dt.strftime("%Y-%m-%d %H:%M:%S")
+            server_time = now_server_str
         else:
             effective_timestamp = int(adopted_time_dt.timestamp())
             human_timestamp = adopted_time_dt.strftime("%Y-%m-%d %H:%M:%S")
+            server_time = adopted_time_dt.strftime("%Y-%m-%d %H:%M:%S") + f".{int(adopted_time_dt.microsecond / 1000):03d}"
 
         
         

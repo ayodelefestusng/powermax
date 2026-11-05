@@ -10,11 +10,10 @@ from sqlalchemy import text
 
 from worker.celery_app import celery_app
 from worker.db import engine
+from worker.logging_config import setup_celery_logging
 
-# Set up logging
-logger = logging.getLogger(__name__)
-if not logger.handlers:
-    logging.basicConfig(level=logging.INFO)
+# Set up Celery logging (celery.log & stdout)
+logger = setup_celery_logging(__name__)
 
 # Evolution API Credentials
 EVOLUTION_API_URL = os.getenv("EVOLUTION_API_URL", "https://vectra-evolution-api2.qgmg5v.easypanel.host")
@@ -778,6 +777,27 @@ def send_power_email(
         
         if server_time_dt.tzinfo is None:
             server_time_dt = lagos_tz.localize(server_time_dt)
+
+        # Reconfirm & guarantee raw timestamp in payload is posted to DB as server_time if drift < 24 hours
+        now_lagos = datetime.now(lagos_tz)
+        try:
+            raw_ts = float(device_time) if device_time is not None else 0.0
+            if raw_ts > 0:
+                if raw_ts > 1e11:  # epoch in milliseconds
+                    raw_ts /= 1000.0
+                payload_dt = datetime.fromtimestamp(raw_ts, tz=lagos_tz)
+                drift_seconds = abs((now_lagos - payload_dt).total_seconds())
+                if drift_seconds < 24 * 3600:
+                    server_time_dt = payload_dt
+                    logger.info(
+                        f"Adopted raw device timestamp as server_time for DB: {server_time_dt} (drift {drift_seconds:.1f}s < 24h)"
+                    )
+                else:
+                    logger.warning(
+                        f"Device timestamp drift ({drift_seconds/3600:.2f}h) exceeds 24-hour threshold. Retaining server arrival time: {server_time_dt}"
+                    )
+        except Exception as ts_chk_err:
+            logger.warning(f"Could not verify device_time drift in worker task: {ts_chk_err}")
 
         # Construct PowerStatus object
         data = PowerStatus(
