@@ -246,39 +246,25 @@ def save_power_status_update(data: PowerStatus, server_time_dt,
 
     try:
         with engine.begin() as conn:
-            # Check if feeder exists
-            feeder_query = text("SELECT id, transformer_name, sim_serial, msisdn, transformer_code FROM myapp_feeder WHERE name = :name")
+            # 1. Fetch or create Feeder (myapp_feeder no longer has transformer columns)
+            feeder_query = text("SELECT id, sim_serial, msisdn FROM myapp_feeder WHERE name = :name")
             feeder = conn.execute(feeder_query, {"name": data.feeder_name}).fetchone()
-            
-            # Look up Feeder.transformer_name using transformer_code
-            resolved_transformer_name = "UNKNOWN_TRANSFORMER"
-            if data.transformer_code and data.transformer_code != "UNKNOWN_TRANSFORMER":
-                lookup_query = text("SELECT transformer_name FROM myapp_feeder WHERE transformer_code = :code LIMIT 1")
-                lookup_res = conn.execute(lookup_query, {"code": data.transformer_code}).fetchone()
-                if lookup_res and lookup_res[0]:
-                    resolved_transformer_name = lookup_res[0]
-                else:
-                    resolved_transformer_name = data.transformer_code
-            else:
-                resolved_transformer_name = data.transformer_code
 
             if not feeder:
                 # Create feeder with default WhatsApp recipients
                 insert_feeder_query = text("""
                     INSERT INTO myapp_feeder (
-                        name, transformer_name, transformer_code, sim_serial, msisdn,
+                        name, sim_serial, msisdn,
                         band, created_at, whatsapp_primary, whatsapp_group
                     )
                     VALUES (
-                        :name, :transformer_name, :transformer_code, :sim_serial, :msisdn,
+                        :name, :sim_serial, :msisdn,
                         'A', :created_at, :whatsapp_primary, :whatsapp_group
                     )
                     RETURNING id
                 """)
                 feeder_id = conn.execute(insert_feeder_query, {
                     "name": data.feeder_name,
-                    "transformer_name": resolved_transformer_name,
-                    "transformer_code": data.transformer_code,
                     "sim_serial": data.sim_serial,
                     "msisdn": data.msisdn,
                     "created_at": now_local,
@@ -287,21 +273,53 @@ def save_power_status_update(data: PowerStatus, server_time_dt,
                 }).scalar()
             else:
                 feeder_id = feeder[0]
-                # Update feeder fields if they changed
-                if feeder[1] != resolved_transformer_name or feeder[2] != data.sim_serial or feeder[3] != data.msisdn or feeder[4] != data.transformer_code:
+                # Update feeder fields if hardware SIM/MSISDN changed
+                if feeder[1] != data.sim_serial or feeder[2] != data.msisdn:
                     update_feeder_query = text("""
                         UPDATE myapp_feeder
-                        SET transformer_name = :transformer_name, transformer_code = :transformer_code,
-                            sim_serial = :sim_serial, msisdn = :msisdn
+                        SET sim_serial = :sim_serial, msisdn = :msisdn
                         WHERE id = :id
                     """)
                     conn.execute(update_feeder_query, {
-                        "transformer_name": resolved_transformer_name,
-                        "transformer_code": data.transformer_code,
                         "sim_serial": data.sim_serial,
                         "msisdn": data.msisdn,
                         "id": feeder_id
                     })
+
+            # 2. Manage Transformer record linked to this Feeder (Transformer FK -> Feeder)
+            tf_code = (data.transformer_code or "UNKNOWN_TRANSFORMER").strip()
+            resolved_transformer_name = tf_code
+
+            if tf_code and tf_code != "UNKNOWN_TRANSFORMER":
+                lookup_tf = conn.execute(
+                    text("SELECT id, name FROM myapp_transformer WHERE feeder_id = :feeder_id AND transformer_code = :code LIMIT 1"),
+                    {"feeder_id": feeder_id, "code": tf_code}
+                ).fetchone()
+
+                if lookup_tf:
+                    resolved_transformer_name = lookup_tf[1] or tf_code
+                else:
+                    # Look up if any transformer with this code exists to adopt its name
+                    lookup_any = conn.execute(
+                        text("SELECT name FROM myapp_transformer WHERE transformer_code = :code AND name != :code LIMIT 1"),
+                        {"code": tf_code}
+                    ).fetchone()
+                    if lookup_any and lookup_any[0]:
+                        resolved_transformer_name = lookup_any[0]
+
+                    # Insert new transformer row for this feeder
+                    conn.execute(
+                        text("""
+                            INSERT INTO myapp_transformer (feeder_id, name, transformer_code, is_active)
+                            VALUES (:feeder_id, :name, :code, TRUE)
+                            ON CONFLICT (feeder_id, transformer_code) DO NOTHING
+                        """),
+                        {
+                            "feeder_id": feeder_id,
+                            "name": resolved_transformer_name,
+                            "code": tf_code,
+                        }
+                    )
             
             # Check previous power status for this feeder to detect actual state change
             prev_status_query = text("""

@@ -573,10 +573,10 @@ def generate_power_report(feeder, target_date, is_today=True):
         if feeder_clean:
             tags.append(f"#{feeder_clean}")
             
-        # Get transformer name from DB
+        # Get transformer name from DB (via FK feeder_id in myapp_transformer)
         transformer = None
         with engine.connect() as conn:
-            t_query = text("SELECT transformer_name FROM myapp_feeder WHERE id = :feeder_id")
+            t_query = text("SELECT name FROM myapp_transformer WHERE feeder_id = :feeder_id AND is_active = TRUE LIMIT 1")
             t_row = conn.execute(t_query, {"feeder_id": feeder.id}).fetchone()
             if t_row and t_row[0]:
                 transformer = t_row[0]
